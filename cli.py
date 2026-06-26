@@ -1,0 +1,396 @@
+import typer
+import uuid
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+import os
+import asyncio
+from src.config.settings import load_settings
+from src.llm.openai_provider import OpenAIProvider
+from src.tools.registery import ToolRegistry
+from src.tools.shell import run_shell_command
+from src.core.agent import Agent
+from src.memory.mongo_stm import MongoSTM
+from src.memory.long_term import LongTermMemory
+from src.llm.base import Message
+from src.tools.codebase_graph import search_codebase, get_codebase_overview
+from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree
+from src.tools.planning import create_project_plan, update_project_plan, ask_user_question, update_plan_text
+from src.tools.git_tools import run_git
+from prompts.registry import get_default_prompt
+from src.mcp.bridge import MCPBridge
+
+app = typer.Typer()
+console = Console()
+
+
+def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegistry, session_id: str, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None) -> Agent:
+    """Create a new agent session with the given configuration."""
+    db_conf = config['database']
+    memory = MongoSTM(
+        mongo_uri=db_conf['mongo_uri'],
+        db_name=db_conf['db_name'],
+        collection_name=db_conf['collection_name'],
+        session_id=session_id,
+        system_prompt=get_default_prompt(working_dir=working_directory),
+        max_messages=config['memory']['short_term']['max_tokens']
+    )
+    return Agent(llm=llm, registry=registry, memory=memory, console=console, ltm=ltm, llm_config=llm_config, working_directory=working_directory)
+
+
+
+def main():
+    config = load_settings()
+    llm = OpenAIProvider(config['llm'])
+    db_conf = config['database']
+    registry = ToolRegistry()
+    working_directory = os.getcwd()
+
+    #-- SHELL COMMAND TOOL -----------------------------------------------------
+    registry.register(
+        name="run_shell_command",
+        description="Executes a bash shell command on the local machine and returns the output. Use this to list files, run scripts, or check code.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The bash command to run."
+                }
+            },
+            "required": ["command"]
+        },
+        function=run_shell_command
+    )
+
+    #-- CODEBASE SEARCH TOOL ---------------------------------------------------
+    registry.register(
+       name="search_codebase",
+        description="Queries the architecture of the local codebase. Use this BEFORE writing code to find where functions/classes are defined, what calls what, and how the project is structured.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "The function, class, or variable name to search for (e.g., 'Agent', 'complete', 'MongoSTM')."
+                }
+            },
+            "required": ["query"]
+        },
+        function=search_codebase
+    )
+
+    #-- FILE TOOLS -------------------------------------------------------------
+    registry.register(
+        name="read_file",
+        description="Reads a file's contents. ALWAYS use this to examine code before editing it. Use start_line and end_line (0-indexed) if you only need a specific chunk.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to read."},
+                "start_line": {"type": "integer", "description": "Starting line index (default 0)."},
+                "end_line": {"type": "integer", "description": "Ending line index (default -1 for all)."}
+            },
+            "required": ["file_path"]
+        },
+        function=read_file
+    )
+
+    registry.register(
+        name="write_file",
+        description="OVERWRITES a file entirely with new content. Use this to create new files or completely replace existing ones. Creates directories automatically.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to write."},
+                "content": {"type": "string", "description": "The full exact content to write to the file."}
+            },
+            "required": ["file_path", "content"]
+        },
+        function=write_file
+    )
+
+    #-- APPLY DIFF TOOL --------------------------------------------------------
+    registry.register(
+        name="apply_diff",
+        description="Surgically edits a file by replacing an exact block of text. PREFER THIS over write_file for making small changes, fixing bugs, or updating specific functions. Do NOT use this to create new files.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "The path to the file to edit."},
+                "old_string": {"type": "string", "description": "The exact block of text to find and replace. MUST match exactly, including whitespace and indentation."},
+                "new_string": {"type": "string", "description": "The new text to replace the old text with."}
+            },
+            "required": ["file_path", "old_string", "new_string"]
+        },
+        function=apply_diff
+    )
+
+    #-- GIT TOOLS -------------------------------------------------------------
+    registry.register(
+        name="run_git",
+        description="Executes a git command. Use this to check status, commit changes, or view history. Pass the arguments as a single string.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "args": {"type": "string", "description": "Git arguments, e.g., 'status', 'add .', 'commit -m \"fixed bug\"'"}
+            },
+            "required": ["args"]
+        },
+        function=run_git
+    )
+
+    #-- PROJECT PLAN TOOLS -----------------------------------------------------
+    registry.register(
+        name="create_project_plan",
+        description=(
+            "MANDATORY for any task touching more than 2 files. "
+            "Call get_codebase_overview FIRST so you can populate the 'files' field on every step."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "step":  {"type": "string", "description": "What to do in this step."},
+                            "files": {"type": "array", "items": {"type": "string"}, "description": "Files to read or write in this step."}
+                        },
+                        "required": ["step"]
+                    },
+                    "description": "Ordered list of steps, each with a description and the files it will touch."
+                }
+            },
+            "required": ["steps"]
+        },
+        function=create_project_plan
+    )
+
+    registry.register(
+        name="update_plan_status",
+        description="Mark a plan step as in_progress, completed, or failed. Call this when you start AND finish every step.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "step_number": {"type": "integer", "description": "1-based step number."},
+                "status": {"type": "string", "enum": ["completed", "in_progress", "failed"], "description": "New status."}
+            },
+            "required": ["step_number", "status"]
+        },
+        function=update_project_plan
+    )
+
+    registry.register(
+        name="update_plan_text",
+        description="Rename or rewrite a step's description mid-task (e.g. if scope changed).",
+        parameters={
+            "type": "object",
+            "properties": {
+                "step_number": {"type": "integer", "description": "1-based step number to update."},
+                "new_text": {"type": "string", "description": "Replacement text for the step title."}
+            },
+            "required": ["step_number", "new_text"]
+        },
+        function=update_plan_text
+    )
+
+    registry.register(
+        name="ask_user_question",
+        description="Pause and ask the user a clarifying question before continuing. Use question_type='mcq' for multiple choice.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "question":      {"type": "string", "description": "The question to ask."},
+                "question_type": {"type": "string", "enum": ["text", "mcq"], "description": "Free text or multiple choice."},
+                "options":       {"type": "array", "items": {"type": "string"}, "description": "Choices for MCQ questions."}
+            },
+            "required": ["question"]
+        },
+        function=ask_user_question
+    )
+
+    #-- CODEBASE OVERVIEW TOOLS ------------------------------------------------
+    registry.register(
+        name="get_codebase_overview",
+        description=(
+            "Returns every file in the project with its functions and classes listed. "
+            "Call this BEFORE create_project_plan so you know exactly which files to reference in each step."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "directory": {"type": "string", "description": "Directory to index. Defaults to the current working directory."}
+            }
+        },
+        function=lambda directory=None: get_codebase_overview(directory or working_directory)
+    )
+
+    registry.register(
+        name="get_file_tree",
+        description=(
+            "Returns a directory tree of all files (including configs, markdown, templates). "
+            "Complements get_codebase_overview for non-code files."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "directory": {"type": "string", "description": "Directory to list. Defaults to the current working directory."},
+                "max_depth":  {"type": "integer", "description": "Max folder depth (default 4)."}
+            }
+        },
+        function=lambda directory=None, max_depth=4: get_file_tree(directory or working_directory, max_depth)
+    )
+
+    #-- MCP TOOLS -------------------------------------------------------------
+
+    mcp_bridges = []  # keep references to ALL bridges for clean shutdown
+    if "mcp_servers" in config:
+        for server_name, server_conf in config["mcp_servers"].items():
+            console.print(f"[bold cyan]Connecting to MCP Server: {server_name}...[/bold cyan]")
+            try:
+                mcp_bridge = MCPBridge(
+                    url=server_conf["url"],
+                    headers=server_conf.get("headers", {})
+                )
+                mcp_bridge.sync_connect()  # blocks until tools are listed (or raises)
+                mcp_bridges.append(mcp_bridge)
+
+                # Inject MCP tools into our local registry!
+                for tool in mcp_bridge.mcp_tools:
+                    # Generic closure to route this specific tool to its bridge
+                    def make_mcp_executor(t_name, bridge):
+                        def executor(**kwargs):
+                            return bridge.call_tool(t_name, kwargs)  # already sync now
+                        return executor
+
+                    registry.register(
+                        name=tool["name"],
+                        description=tool["description"],
+                        parameters=tool["inputSchema"],  # MCP uses standard JSON schema!
+                        function=make_mcp_executor(tool["name"], mcp_bridge)
+                    )
+                console.print(f"[green]✅ Injected {len(mcp_bridge.mcp_tools)} tools from {server_name}.[/green]")
+            except Exception as e:
+                console.print(f"[red]Failed to connect to {server_name}: {e}[/red]")
+
+
+
+    ltm = LongTermMemory(mongo_uri=db_conf['mongo_uri'], db_name=db_conf['db_name'])
+    current_session_id = f"session_{uuid.uuid4().hex[:6]}"
+    agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
+    console.print(Panel(f"[bold green]🚀 Agent Ready[/bold green]\n[dim]Type /help for commands[/dim]"))
+
+    # --- WRAP IN TRY/FINALLY FOR SAFE EXIT ---
+    try:
+        while True:
+            # Multi-line input: press Enter twice (blank line) to submit.
+            console.print(f"[bold blue][{current_session_id}] You[/bold blue] [dim](Enter twice to send):[/dim]")
+            lines = []
+            while True:
+                try:
+                    line = input()
+                except EOFError:
+                    break
+                if line == "" and lines and lines[-1] == "":
+                    lines.pop()   # drop the trailing blank sentinel
+                    break
+                lines.append(line)
+            user_input = "\n".join(lines).strip()
+
+            if not user_input:
+                continue
+
+            if user_input.lower() in ["/exit", "/quit"]:
+                break
+
+            elif user_input.lower() == "/new":
+                current_session_id = f"session_{uuid.uuid4().hex[:6]}"
+                agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
+                console.print(f"[bold green]✨ Started new session: {current_session_id}[/bold green]")
+
+            elif user_input.lower() == "/resume":
+                console.print("[bold cyan]Fetching recent sessions...[/bold cyan]")
+                sessions = MongoSTM.list_recent_sessions(db_conf['mongo_uri'], db_conf['db_name'], db_conf['collection_name'])
+
+                if not sessions:
+                    console.print("[dim]No previous sessions found.[/dim]")
+                    continue
+
+                table = Table(show_header=True, header_style="bold magenta")
+                table.add_column("#", style="dim", width=4)
+                table.add_column("Session ID", style="cyan")
+                table.add_column("Last Updated")
+
+                for i, s in enumerate(sessions):
+                    table.add_row(str(i+1), s['session_id'], str(s.get('updated_at', 'Unknown')))
+
+                console.print(table)
+                choice = console.input("[bold yellow]Enter session number to resume (or 'c' to cancel): [/bold yellow]")
+
+                if choice.lower() == 'c':
+                    continue
+
+                try:
+                    idx = int(choice) - 1
+                    if 0 <= idx < len(sessions):
+                        selected_id = sessions[idx]['session_id']
+                        current_session_id = selected_id
+                        agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
+                        console.print(f"[bold green]♻️  Resumed session: {current_session_id}[/bold green]")
+                    else:
+                        console.print("[bold red]Invalid number.[/bold red]")
+                except ValueError:
+                    console.print("[bold red]Please enter a valid number.[/red]")
+
+            elif user_input.lower() == "/help":
+                console.print(Panel(
+                    "[bold]/new[/bold] - Start a fresh session\n"
+                    "[bold]/resume[/bold] - Pick a previous session\n"
+                    "[bold]/help[/bold] - Show this menu\n"
+                    "[bold]/exit[/bold] - Quit the agent\n\n"
+                    "[dim]Tip: press Enter twice to send a multi-line message.[/dim]",
+                    title="Commands"
+                ))
+
+            else:
+                final_response = agent.chat(user_input, max_iterations=config['agent']['max_iterations'])
+
+                if final_response:
+                    console.print(Panel(final_response, title=f"[bold magenta]Agent [{current_session_id}][/bold magenta]"))
+
+    except KeyboardInterrupt:
+        console.print("\n[dim yellow]Interrupted by user (Ctrl+C).[/dim yellow]")
+
+    finally:
+        # THIS RUNS NO MATTER WHAT (Exit, Ctrl+C, or crash)
+        console.print("[dim]Saving session summary to Long-Term Memory...[/dim]")
+
+        try:
+            # Get context but DON'T add the summary prompt to STM
+            context_for_summary = agent.memory.get_context()
+            context_for_summary.append(
+                Message(role="user", content="Summarize the key accomplishments, facts learned, or code changes made in this session in 2-3 sentences.")
+            )
+
+            # Generate summary (no tools allowed during shutdown!)
+            summary_response = llm.complete(
+                context_for_summary,
+                tools=None,
+                max_tokens=config['llm'].get("max_tokens", 6000)
+            )
+
+            # Save to LTM
+            ltm.save_session_summary(current_session_id, summary_response.content)
+            console.print(f"[bold green]✅ Session {current_session_id} saved to long-term memory. Goodbye![/bold green]")
+            if mcp_bridges:
+                console.print("[dim]Shutting down MCP connections...[/dim]")
+                for bridge in mcp_bridges:
+                    bridge.sync_disconnect()
+        except Exception as e:
+            console.print(f"[bold red]Could not save summary (API might be down): {e}[/bold red]")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,1 @@
+You have looped too many times without finishing the task. Stop trying to use tools. Please provide your final summary based on what you know so far, and explain what blocked you.

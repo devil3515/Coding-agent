@@ -1,0 +1,68 @@
+# ── LLM Configuration ────────────────────────────────────────────────────────
+# Supports any OpenAI-compatible endpoint (OpenAI, Bedrock Mantle, Azure, etc.)
+llm:
+  # Leave blank to use the official OpenAI API (api.openai.com/v1)
+  base_url: "https://your-openai-compatible-endpoint/v1"
+
+  # Model identifier as accepted by your endpoint
+  # Examples:
+  #   OpenAI:        "gpt-4o"
+  #   Bedrock Mantle: "minimax.minimax-m2.5"  or  "anthropic.claude-3-5-sonnet"
+  model: "gpt-4o"
+
+  # Your API key for the endpoint above
+  api_key: "YOUR_API_KEY_HERE"
+
+  temperature: 0.1
+  max_tokens: 8000
+
+  # Optional extra headers required by some providers (e.g. Bedrock Mantle)
+  headers:
+    OpenAI-Project: "default"
+    # X-Custom-Header: "value"
+
+# ── Tool & Sandbox Configuration ─────────────────────────────────────────────
+tools:
+  enabled: true
+  max_tool_calls_per_turn: 5
+  shell_command_timeout: 30       # seconds before a shell command is killed
+
+# ── Memory Configuration ─────────────────────────────────────────────────────
+memory:
+  short_term:
+    max_tokens: 15000             # rolling window kept in MongoDB
+  long_term:
+    backend: "local"              # currently only "local" (MongoDB) is supported
+
+# ── Agent Core Configuration ─────────────────────────────────────────────────
+agent:
+  max_iterations: 100             # hard cap on tool-call loops per user message
+
+# ── Observability ────────────────────────────────────────────────────────────
+logging:
+  level: "INFO"                   # DEBUG | INFO | WARNING | ERROR
+  save_to_file: false
+  file_path: "agent_logs.jsonl"   # used only when save_to_file: true
+
+# ── Database Configuration ───────────────────────────────────────────────────
+# Used for short-term memory (conversation history) and long-term memory (summaries).
+# Free tier: https://www.mongodb.com/atlas/database
+database:
+  mongo_uri: "mongodb+srv://<username>:<password>@<cluster>.mongodb.net/"
+  db_name: "coding_agent_db"
+  collection_name: "short_term_memory"
+
+# ── MCP Servers (optional) ───────────────────────────────────────────────────
+# Remove this section entirely if you don't use any MCP tools.
+mcp_servers:
+  # Google Stitch — UI generation
+  google_stitch:
+    url: "https://stitch.googleapis.com/mcp"
+    headers:
+      X-Goog-Api-Key: "YOUR_GOOGLE_STITCH_API_KEY_HERE"
+
+  # Add more MCP servers below in the same format:
+  # my_server:
+  #   url: "https://my-mcp-server.example.com/mcp"
+  #   headers:
+  #     Authorization: "Bearer YOUR_TOKEN_HERE"
