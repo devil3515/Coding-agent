@@ -285,21 +285,9 @@ def main():
     # --- WRAP IN TRY/FINALLY FOR SAFE EXIT ---
     try:
         while True:
-            # Multi-line input: press Enter twice (blank line) to submit.
-            console.print(f"[bold blue][{current_session_id}] You[/bold blue] [dim](Enter twice to send):[/dim]")
-            lines = []
-            while True:
-                try:
-                    line = input()
-                except EOFError:
-                    break
-                if line == "" and lines and lines[-1] == "":
-                    lines.pop()   # drop the trailing blank sentinel
-                    break
-                lines.append(line)
-            user_input = "\n".join(lines).strip()
+            user_input = console.input(f"[bold blue][{current_session_id}] You:> [/bold blue]")
 
-            if not user_input:
+            if not user_input.strip():
                 continue
 
             if user_input.lower() in ["/exit", "/quit"]:
