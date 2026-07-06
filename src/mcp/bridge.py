@@ -112,7 +112,7 @@ class MCPBridge:
             future = asyncio.run_coroutine_threadsafe(
                 self.session.call_tool(tool_name, arguments=arguments), self._loop
             )
-            result = future.result(timeout=60)
+            result = future.result(timeout=180)
             return "".join(block.text for block in result.content if hasattr(block, "text"))
         except Exception as e:
             return f"Error calling tool '{tool_name}': {str(e)}"

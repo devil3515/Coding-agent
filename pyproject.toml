@@ -17,4 +17,19 @@ dependencies = [
     "tree-sitter-javascript>=0.25.0",
     "tree-sitter-typescript>=0.23.2",
     "mcp>=1.28.0",
+    "prompt-toolkit>=3.0.0"
 ]
+
+[project.scripts]
+coding-agent = "cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli"]
+packages = ["src", "prompts"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml", "*.example"]

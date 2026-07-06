@@ -4,6 +4,7 @@ from datetime import datetime
 from src.memory.base import BaseMemory
 from src.llm.base import Message, ToolCall
 from pymongo import MongoClient
+from src.models import ShortTermMemoryModel
 import tiktoken
 
 
@@ -36,11 +37,17 @@ class MongoSTM(BaseMemory):
         except Exception as e:
             raise ConnectionError(f"Failed to connect to MongoDB: {e}")
 
-        self.collection.update_one(
-            {"session_id": self.session_id},
-            {"$setOnInsert": {"system_prompt": system_prompt, "created_at": datetime.utcnow()}},
-            upsert=True
-        )
+        # Initialize session document if it does not exist using the model
+        doc = self.collection.find_one({"session_id": self.session_id})
+        if not doc:
+            stm_model = ShortTermMemoryModel(
+                session_id=self.session_id,
+                system_prompt=system_prompt,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+                messages=[]
+            )
+            self.collection.insert_one(asdict(stm_model))
 
         try:
             self.encoding = tiktoken.encoding_for_model(model)
@@ -62,13 +69,16 @@ class MongoSTM(BaseMemory):
     # Read path — compaction happens HERE, on the way out to the LLM.
     # ------------------------------------------------------------------
     def get_context(self) -> list[Message]:
-        doc = self.collection.find_one({"session_id": self.session_id}, {"messages": 1, "system_prompt": 1})
+        doc = self.collection.find_one({"session_id": self.session_id})
         if not doc:
-            return [Message(role="system", content=self.system_prompt)]
+            stm_model = ShortTermMemoryModel(
+                session_id=self.session_id,
+                system_prompt=self.system_prompt,
+                messages=[]
+            )
+            return [Message(role="system", content=stm_model.system_prompt)]
 
-        system_msg = Message(role="system", content=doc.get("system_prompt", self.system_prompt))
         raw_messages = doc.get("messages", [])
-
         history = []
         for m in raw_messages:
             tool_calls = [ToolCall(**tc) for tc in m.get("tool_calls", [])] if m.get("tool_calls") else []
@@ -77,8 +87,17 @@ class MongoSTM(BaseMemory):
                 tool_call_id=m.get("tool_call_id"), tool_calls=tool_calls
             ))
 
-        history = self._compact_for_context(history)
-        return [system_msg] + history
+        stm_model = ShortTermMemoryModel(
+            session_id=doc["session_id"],
+            system_prompt=doc.get("system_prompt", self.system_prompt),
+            created_at=doc.get("created_at", datetime.utcnow()),
+            updated_at=doc.get("updated_at", datetime.utcnow()),
+            messages=history
+        )
+
+        system_msg = Message(role="system", content=stm_model.system_prompt)
+        compacted_history = self._compact_for_context(stm_model.messages)
+        return [system_msg] + compacted_history
 
 
     def _compact_for_context(self, history: list[Message]) -> list[Message]:

@@ -12,7 +12,7 @@ class Agent:
     The core reasoning loop of the coding agent.
     Completely decoupled from the CLI.
     """
-    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None):
+    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, session_id: str = None):
         self.llm = llm
         self.registry = registry
         self.memory = memory
@@ -20,11 +20,14 @@ class Agent:
         self.ltm = ltm
         self.llm_config = llm_config or {}
         self.working_directory = working_directory
+        self.session_id = session_id
         # --- TOKEN TRACKING STATE ---
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         # --- PLAN STATE (list of dicts: {title, files, status}) ---
         self.current_plan: list[dict] = []
+        # --- TOUCHED FILES STATE ---
+        self.touched_files = set()
 
     def _print_token_usage(self, response, action_text: str):
         """Helper to format and print token usage cleanly."""
@@ -217,6 +220,12 @@ class Agent:
                     # ==========================================
                     else:
                         result = self.registry.execute(tool_call.name, args)
+
+                        # Track modified files
+                        if tool_call.name in ["write_file", "apply_diff"]:
+                            fp = args.get("file_path")
+                            if fp:
+                                self.touched_files.add(fp)
 
                         # -- PRINT THE TOOL NAME PROMINENTLY ----------------------------
                         self.console.print(f"[bold cyan]🔧 Tool:[/bold cyan] [magenta]{tool_call.name}[/magenta]")

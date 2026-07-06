@@ -4,7 +4,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 import os
+import json
 import asyncio
+import hashlib
+from datetime import datetime
+from dataclasses import asdict
 from src.config.settings import load_settings
 from src.llm.openai_provider import OpenAIProvider
 from src.tools.registery import ToolRegistry
@@ -12,6 +16,8 @@ from src.tools.shell import run_shell_command
 from src.core.agent import Agent
 from src.memory.mongo_stm import MongoSTM
 from src.memory.long_term import LongTermMemory
+from src.memory.project_memory import ProjectMemoryManager
+from src.models import ShortTermMemoryModel, LongTermMemoryModel, ProjectMemoryContent, ProjectMemoryModel
 from src.llm.base import Message
 from src.tools.codebase_graph import search_codebase, get_codebase_overview
 from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree
@@ -19,6 +25,10 @@ from src.tools.planning import create_project_plan, update_project_plan, ask_use
 from src.tools.git_tools import run_git
 from prompts.registry import get_default_prompt
 from src.mcp.bridge import MCPBridge
+from prompt_toolkit import PromptSession
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.history import InMemoryHistory
+from prompt_toolkit.formatted_text import HTML
 
 app = typer.Typer()
 console = Console()
@@ -30,12 +40,12 @@ def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegist
     memory = MongoSTM(
         mongo_uri=db_conf['mongo_uri'],
         db_name=db_conf['db_name'],
-        collection_name=db_conf['collection_name'],
+        collection_name=db_conf.get('stm_collection', db_conf.get('collection_name', 'short_term_memory')),
         session_id=session_id,
         system_prompt=get_default_prompt(working_dir=working_directory),
         max_messages=config['memory']['short_term']['max_tokens']
     )
-    return Agent(llm=llm, registry=registry, memory=memory, console=console, ltm=ltm, llm_config=llm_config, working_directory=working_directory)
+    return Agent(llm=llm, registry=registry, memory=memory, console=console, ltm=ltm, llm_config=llm_config, working_directory=working_directory, session_id=session_id)
 
 
 
@@ -45,6 +55,10 @@ def main():
     db_conf = config['database']
     registry = ToolRegistry()
     working_directory = os.getcwd()
+    abs_path = os.path.abspath(working_directory)
+
+    project_id = hashlib.sha256(abs_path.encode()).hexdigest()[:16]
+
 
     #-- SHELL COMMAND TOOL -----------------------------------------------------
     registry.register(
@@ -277,15 +291,67 @@ def main():
 
 
 
-    ltm = LongTermMemory(mongo_uri=db_conf['mongo_uri'], db_name=db_conf['db_name'])
+    ltm = LongTermMemory(
+        mongo_uri=db_conf['mongo_uri'],
+        db_name=db_conf['db_name'],
+        collection_name=db_conf.get('ltm_collection', 'long_term_memory')
+    )
+
+    project_mem_mgr = ProjectMemoryManager(
+        mongo_uri=db_conf['mongo_uri'],
+        db_name=db_conf['db_name'],
+        collection_name=db_conf.get('project_memory_collection', 'project_memory')
+    )
+
+    project_name = os.path.basename(abs_path)
+    project_mem = project_mem_mgr.get_project_memory(project_id)
+    if not project_mem:
+        project_mem = ProjectMemoryModel(
+            project_id=project_id,
+            name=project_name,
+            path=abs_path,
+            memory=ProjectMemoryContent(),
+            recent_sessions=[],
+            updated_at=datetime.utcnow()
+        )
+
     current_session_id = f"session_{uuid.uuid4().hex[:6]}"
-    agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
-    console.print(Panel(f"[bold green]🚀 Agent Ready[/bold green]\n[dim]Type /help for commands[/dim]"))
+    agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory)
+
+    # PRINT startup diagnostic panel
+    diag_msg = (
+        f"[bold cyan]Session ID:[/bold cyan] {current_session_id}\n"
+        f"[bold cyan]LLM Model:[/bold cyan] {config['llm'].get('model', 'Unknown')}\n"
+        f"[bold cyan]MongoDB Status:[/bold cyan] Connected successfully\n"
+        f"[bold cyan]STM Collection:[/bold cyan] {db_conf.get('stm_collection', db_conf.get('collection_name', 'short_term_memory'))}\n"
+        f"[bold cyan]LTM Collection:[/bold cyan] {db_conf.get('ltm_collection', 'long_term_memory')}\n"
+        f"[bold cyan]Project Memory Collection:[/bold cyan] {db_conf.get('project_memory_collection', 'project_memory')}\n"
+        f"[bold cyan]Project Name:[/bold cyan] {project_name} (ID: {project_id})\n"
+        f"[bold cyan]Project Path:[/bold cyan] {abs_path}\n"
+        f"[bold cyan]Project Status:[/bold cyan] {'Recognized (has existing memory)' if project_mem.memory.purpose else 'New (uninitialized memory)'}"
+    )
+    console.print(Panel(diag_msg, title="🛠️ Agent Diagnostic Startup", border_style="bold green"))
+    console.print(Panel(f"[bold green]🚀 Agent Ready[/bold green]\n[dim]Type /help for commands. Use Enter to send, and Shift+Enter/Alt+Enter for newlines.[/dim]"))
+
+    bindings = KeyBindings()
+
+    @bindings.add("enter")
+    def submit(event):
+        event.current_buffer.validate_and_handle()
+
+    @bindings.add("escape", "enter")
+    @bindings.add("escape", "[", "1", "3", ";", "2", "u")
+    @bindings.add("c-j")
+    def insert_newline(event):
+        event.current_buffer.insert_text("\n")
+
+    session = PromptSession(history=InMemoryHistory())
 
     # --- WRAP IN TRY/FINALLY FOR SAFE EXIT ---
     try:
         while True:
-            user_input = console.input(f"[bold blue][{current_session_id}] You:> [/bold blue]")
+            prompt_html = HTML(f"<ansiblue><b>[{current_session_id}] You:&gt; </b></ansiblue>")
+            user_input = session.prompt(prompt_html, multiline=True, key_bindings=bindings)
 
             if not user_input.strip():
                 continue
@@ -300,7 +366,7 @@ def main():
 
             elif user_input.lower() == "/resume":
                 console.print("[bold cyan]Fetching recent sessions...[/bold cyan]")
-                sessions = MongoSTM.list_recent_sessions(db_conf['mongo_uri'], db_conf['db_name'], db_conf['collection_name'])
+                sessions = MongoSTM.list_recent_sessions(db_conf['mongo_uri'], db_conf['db_name'], db_conf.get('stm_collection', db_conf.get('collection_name', 'short_term_memory')))
 
                 if not sessions:
                     console.print("[dim]No previous sessions found.[/dim]")
@@ -355,6 +421,7 @@ def main():
         # THIS RUNS NO MATTER WHAT (Exit, Ctrl+C, or crash)
         console.print("[dim]Saving session summary to Long-Term Memory...[/dim]")
 
+        summary_text = "No summary available"
         try:
             # Get context but DON'T add the summary prompt to STM
             context_for_summary = agent.memory.get_context()
@@ -368,16 +435,40 @@ def main():
                 tools=None,
                 max_tokens=config['llm'].get("max_tokens", 6000)
             )
+            summary_text = summary_response.content
 
             # Save to LTM
-            ltm.save_session_summary(current_session_id, summary_response.content)
-            console.print(f"[bold green]✅ Session {current_session_id} saved to long-term memory. Goodbye![/bold green]")
-            if mcp_bridges:
-                console.print("[dim]Shutting down MCP connections...[/dim]")
-                for bridge in mcp_bridges:
-                    bridge.sync_disconnect()
+            ltm.save_session_summary(current_session_id, summary_text)
+            console.print(f"[bold green]✅ Session {current_session_id} saved to long-term memory.[/bold green]")
         except Exception as e:
             console.print(f"[bold red]Could not save summary (API might be down): {e}[/bold red]")
+
+        # Update Project Memory
+        console.print("[dim]Updating Project Memory...[/dim]")
+        try:
+            conversation_context = agent.memory.get_context()
+            project_mem = project_mem_mgr.generate_and_update_project_memory(
+                project_mem=project_mem,
+                conversation_context=conversation_context,
+                llm=llm,
+                session_id=current_session_id,
+                session_summary=summary_text,
+                working_directory=working_directory
+            )
+            console.print("[bold green]✅ Project memory saved to MongoDB.[/bold green]")
+            local_mem_file = os.path.join(working_directory, ".agent-memory.json")
+            console.print(f"[bold green]✅ Exported project context to {local_mem_file}[/bold green]")
+        except Exception as e:
+            console.print(f"[bold red]Could not update project memory: {e}[/bold red]")
+
+        if mcp_bridges:
+            console.print("[dim]Shutting down MCP connections...[/dim]")
+            for bridge in mcp_bridges:
+                try:
+                    bridge.sync_disconnect()
+                except Exception:
+                    pass
+        console.print("[bold green]Goodbye![/bold green]")
 
 
 if __name__ == "__main__":

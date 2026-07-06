@@ -1,6 +1,8 @@
 from datetime import datetime
+from dataclasses import asdict
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
+from src.models import LongTermMemoryModel
 
 
 class LongTermMemory:
@@ -16,9 +18,14 @@ class LongTermMemory:
 
     def save_session_summary(self, session_id: str, summary: str):
         """Call this when a session ends to save what was accomplished."""
+        ltm_model = LongTermMemoryModel(
+            session_id=session_id,
+            summary=summary,
+            updated_at=datetime.utcnow()
+        )
         self.collection.update_one(
             {"session_id": session_id},
-            {"$set": {"summary": summary, "updated_at": datetime.utcnow()}},
+            {"$set": asdict(ltm_model)},
             upsert=True
         )
 
@@ -36,7 +43,21 @@ class LongTermMemory:
         if not docs:
             return ""
 
+        models = [
+            LongTermMemoryModel(
+                session_id=doc["session_id"],
+                summary=doc["summary"],
+                updated_at=doc.get("updated_at", datetime.utcnow())
+            )
+            for doc in docs
+        ]
+
         context_str = "Here is what you remember from previous sessions:\n"
-        for doc in docs:
-            context_str += f"- [{doc['session_id']}]: {doc['summary']}\n"
+        for m in models:
+            context_str += f"- [{m.session_id}]: {m.summary}\n"
         return context_str
+
+    def check_project_in_memory(self, project_id: str) -> bool:
+        doc = self.collection.find_one({"project_id": project_id})
+        return doc is not None
+        
