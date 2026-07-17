@@ -1,57 +1,42 @@
-# import asyncio
-# from mcp.client.sse import sse_client
-# from mcp import ClientSession
-# from typing import Any
-
-# class MCPBridge:
-#     """
-#     Connects to a remote HTTP MCP Server (like Google Stitch).
-#     """
-#     def __init__(self, url: str, headers: dict):
-#         self.url = url
-#         self.headers = headers
-#         self.session: ClientSession = None
-#         self.mcp_tools: list[dict] = []
-
-#     async def connect(self):
-#         """Connects to the remote HTTP MCP server."""
-#         # Use sse_client for remote HTTP streams
-#         async with sse_client(self.url, headers=self.headers) as (read, write):
-#             self.session = ClientSession(read, write)
-#             await self.session.initialize()
-
-#             # Fetch tools
-#             tools_result = await self.session.list_tools()
-#             self.mcp_tools = [
-#                 {"name": t.name, "description": t.description, "inputSchema": t.inputSchema}
-#                 for t in tools_result.tools
-#             ]
-
-#     async def call_tool(self, tool_name: str, arguments: dict) -> str:
-#         """Sends a tool call to the remote server."""
-#         if not self.session:
-#             return "Error: Not connected."
-
-#         try:
-#             result = await self.session.call_tool(tool_name, arguments=arguments)
-#             # Stitch returns unstructured JSON blocks
-#             return "".join(block.text for block in result.content if hasattr(block, 'text'))
-#         except Exception as e:
-#             return f"Error calling tool '{tool_name}': {str(e)}"
-
-#     def sync_connect(self):
-#         asyncio.run(self.connect())
-
-#     def sync_disconnect(self):
-#         pass # SSE connections close automatically when the context manager exits
-
-
-
-
 import asyncio
 import threading
+import logging
 from mcp.client.streamable_http import streamablehttp_client
 from mcp import ClientSession
+
+# MCP tool security configuration
+ALLOWED_MCP_TOOLS = set()  # Empty means allow all - configure per deployment
+BLOCKED_MCP_TOOLS = {
+    "delete", "remove", "rm", "destroy", "drop",
+    "exec", "execute", "run", "shell", "bash",
+    "sudo", "su",
+}
+INPUT_MAX_LENGTH = 10000  # Max chars for tool arguments
+
+logger = logging.getLogger(__name__)
+
+def _validate_mcp_tool_call(tool_name: str, arguments: dict) -> tuple[bool, str]:
+    """
+    Validates an MCP tool call before execution.
+    Returns (is_safe, error_message).
+    """
+    tool_name_lower = tool_name.lower()
+    
+    # Check if tool is explicitly blocked
+    for blocked in BLOCKED_MCP_TOOLS:
+        if blocked in tool_name_lower:
+            return False, f"⛔ SECURITY ERROR: MCP tool '{tool_name}' is blocked (contains '{blocked}')."
+    
+    # Check allowlist if configured
+    if ALLOWED_MCP_TOOLS and tool_name not in ALLOWED_MCP_TOOLS:
+        return False, f"⛔ SECURITY ERROR: MCP tool '{tool_name}' is not in the allowed tools list."
+    
+    # Validate argument sizes to prevent DoS
+    for key, value in arguments.items():
+        if isinstance(value, str) and len(value) > INPUT_MAX_LENGTH:
+            return False, f"⛔ SECURITY ERROR: Argument '{key}' exceeds maximum length of {INPUT_MAX_LENGTH}."
+    
+    return True, ""
 
 class MCPBridge:
     """
@@ -108,6 +93,13 @@ class MCPBridge:
         """Sync wrapper: runs the async call on the bridge's own loop."""
         if not self.session or not self._loop:
             return "Error: Not connected."
+        
+        # Security validation before execution
+        is_safe, error_msg = _validate_mcp_tool_call(tool_name, arguments)
+        if not is_safe:
+            logger.warning(f"Blocked MCP tool call: {tool_name} - {error_msg}")
+            return error_msg
+        
         try:
             future = asyncio.run_coroutine_threadsafe(
                 self.session.call_tool(tool_name, arguments=arguments), self._loop

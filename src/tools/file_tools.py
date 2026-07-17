@@ -1,9 +1,91 @@
 import os
+import fnmatch
 from pathlib import Path
 
 MAX_LINES_PER_READ = 500
 
 _SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
+
+
+def find_files(pattern: str, directory: str = ".", max_results: int = 50) -> str:
+    """
+    Searches for files matching a glob pattern within a directory.
+    Use this to find files by name or pattern (e.g., '*.py', 'test_*.py', '**/models/*.py').
+    
+    Pattern examples:
+    - '*.py' - all .py files in directory
+    - '**/*.py' - all .py files recursively
+    - 'test_*.py' - files starting with test_
+    - 'config.{json,yaml,xml}' - config.json, config.yaml, or config.xml
+    
+    Args:
+        pattern: Glob pattern to match files
+        directory: Starting directory for search (default: current directory)
+        max_results: Maximum number of results to return (default: 50)
+    """
+    root = Path(directory).resolve()
+    if not root.exists():
+        return f"Directory not found: {directory}"
+    
+    if not pattern:
+        return "Error: Pattern cannot be empty."
+    
+    matching_files = []
+    
+    try:
+        # Handle ** pattern for recursive search
+        if '**' in pattern:
+            # Split into prefix and suffix for efficient walking
+            if pattern.startswith('**/'):
+                pattern_tail = pattern[3:]
+                for dirpath, dirnames, filenames in os.walk(root):
+                    # Skip common directories
+                    dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+                    for filename in filenames:
+                        if fnmatch.fnmatch(filename, pattern_tail):
+                            full_path = Path(dirpath) / filename
+                            try:
+                                rel_path = full_path.relative_to(root)
+                                matching_files.append(str(rel_path))
+                            except ValueError:
+                                matching_files.append(str(full_path))
+            else:
+                # Search from root
+                for dirpath, dirnames, filenames in os.walk(root):
+                    dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+                    for filename in filenames:
+                        rel_path = Path(dirpath) / filename
+                        try:
+                            rel_path_str = str(rel_path.relative_to(root))
+                        except ValueError:
+                            rel_path_str = str(rel_path)
+                        if fnmatch.fnmatch(rel_path_str, pattern) or fnmatch.fnmatch(filename, pattern):
+                            matching_files.append(str(rel_path.relative_to(root)))
+        else:
+            # Non-recursive search
+            for filename in os.listdir(root):
+                if fnmatch.fnmatch(filename, pattern):
+                    try:
+                        rel_path = (root / filename).relative_to(root)
+                        matching_files.append(str(rel_path))
+                    except ValueError:
+                        matching_files.append(filename)
+        
+        # Limit results
+        if len(matching_files) > max_results:
+            matching_files = matching_files[:max_results]
+            remaining = len(matching_files) - max_results
+            matching_files.append(f"\n... and {remaining} more files (max_results={max_results})")
+        
+        if not matching_files:
+            return f"No files found matching pattern '{pattern}' in {directory}"
+        
+        return f"Found {len([f for f in matching_files if not f.startswith('...')])} files:\n" + "\n".join(matching_files)
+    
+    except PermissionError:
+        return f"Permission denied accessing {directory}"
+    except Exception as e:
+        return f"Error searching files: {str(e)}"
 
 
 def get_file_tree(directory: str = ".", max_depth: int = 4) -> str:

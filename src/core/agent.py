@@ -1,18 +1,20 @@
 import json
 from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn
 from src.llm.base import Message
 from src.tools.registery import ToolRegistry
 from src.memory.base import BaseMemory
 from src.memory.long_term import LongTermMemory
 from src.safety.guardrails import is_safe_path, is_shell_safe
 from src.tools.planning import create_project_plan as _create_project_plan
+from src.core.skill_core import SkillManager
 
 class Agent:
     """
     The core reasoning loop of the coding agent.
     Completely decoupled from the CLI.
     """
-    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, session_id: str = None):
+    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, session_id: str = None, skill_manager: SkillManager = None):
         self.llm = llm
         self.registry = registry
         self.memory = memory
@@ -21,13 +23,65 @@ class Agent:
         self.llm_config = llm_config or {}
         self.working_directory = working_directory
         self.session_id = session_id
+        self.skill_manager = skill_manager or SkillManager()
         # --- TOKEN TRACKING STATE ---
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         # --- PLAN STATE (list of dicts: {title, files, status}) ---
         self.current_plan: list[dict] = []
-        # --- TOUCHED FILES STATE ---
+        # --- TOGGLED FILES STATE ---
         self.touched_files = set()
+        # --- SEARCH CONTEXT TRACKER (prevents redundant searches) ---
+        self._discovered_context: dict[str, str] = {}  # query -> summary of results
+        # --- SKILL STATE ---
+        self.active_skill_name: str | None = None
+
+    def get_context_usage(self) -> dict:
+        """Get context window usage if memory supports it."""
+        if hasattr(self.memory, 'get_token_usage'):
+            return self.memory.get_token_usage()
+        return None
+
+    def print_context_bar(self):
+        """Print a context window usage bar to the console."""
+        usage = self.get_context_usage()
+        if not usage:
+            return
+        
+        used = usage['used']
+        total = usage['total']
+        pct = usage['percentage']
+        
+        # Color based on usage
+        if pct < 50:
+            color = "green"
+            status_emoji = "✅"
+        elif pct < 75:
+            color = "yellow"
+            status_emoji = "⚠️"
+        elif pct < 90:
+            color = "orange"
+            status_emoji = "🔶"
+        else:
+            color = "red"
+            status_emoji = "🚨"
+        
+        # Create a visual bar (50 chars wide)
+        bar_width = 40
+        filled = int((pct / 100) * bar_width)
+        empty = bar_width - filled
+        bar = "█" * filled + "░" * empty
+        
+        # Format numbers with K suffix
+        def format_tokens(n):
+            if n >= 1000:
+                return f"{n/1000:.1f}K"
+            return str(n)
+        
+        self.console.print(
+            f"[dim]{status_emoji} Context: [{color}]{bar}[/] "
+            f"{format_tokens(used)}/{format_tokens(total)} tokens ({pct:.1f}%)[/dim]"
+        )
 
     def _print_token_usage(self, response, action_text: str):
         """Helper to format and print token usage cleanly."""
@@ -76,6 +130,19 @@ class Agent:
                         role="system",
                         content=f"{context[0].content}\n\n{past_context}"
                     )
+
+            #-- INJECT DISCOVERED SEARCH CONTEXT (prevents redundant iterations) --
+            if self._discovered_context and context[0].role == "system":
+                search_context_lines = ["\n\n" + "="*60 + "\n🔍 PREVIOUSLY DISCOVERED CONTEXT (CRITICAL - DO NOT RE-SEARCH)\n" + "="*60 + "\n"]
+                for query, summary in list(self._discovered_context.items())[:10]:  # Limit to 10 entries
+                    if not query.startswith("kw:"):  # Skip keyword entries in display
+                        search_context_lines.append(f"• '{query}': {summary}")
+                search_context_lines.append("\n⚠️  IMPORTANT: These searches have already been done. USE this context instead of re-searching. If you call search_codebase again for similar queries, you will waste iterations.")
+                
+                context[0] = Message(
+                    role="system",
+                    content=f"{context[0].content}{''.join(search_context_lines)}"
+                )
 
             #-- INJECT WORKING DIRECTORY ----------------------------------------
             if self.working_directory and context[0].role == "system":
@@ -142,6 +209,32 @@ class Agent:
                         self.console.print(f"[bold red]{result}[/bold red]")
                         self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
                         continue
+
+                    # ==========================================
+                    # 0. PARALLEL AGENT TOOL HANDLING
+                    # ==========================================
+                    parallel_tools = ["dispatch_agents"]
+                    if tool_call.name in parallel_tools:
+                        from src.core.parallel_agent import PARALLEL_AGENT_TOOLS
+                        if tool_call.name in PARALLEL_AGENT_TOOLS:
+                            result = PARALLEL_AGENT_TOOLS[tool_call.name]["function"](**args)
+                            self.console.print(f"[bold cyan]🔧 Parallel Agent:[/bold cyan] [magenta]{tool_call.name}[/magenta]")
+                            self.console.print(f"[white]   Result: {result}[/white]")
+                            self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                            continue
+
+                    # ==========================================
+                    # 1. SKILL TOOL HANDLING
+                    # ==========================================
+                    skill_tools = ["activate_skill", "complete_skill", "list_skills", "get_active_skill"]
+                    if tool_call.name in skill_tools:
+                        from src.tools.skills import SKILL_TOOLS
+                        if tool_call.name in SKILL_TOOLS:
+                            result = SKILL_TOOLS[tool_call.name]["function"](**args)
+                            self.console.print(f"[bold cyan]🔧 Skill Tool:[/bold cyan] [magenta]{tool_call.name}[/magenta]")
+                            self.console.print(f"[white]   Result: {result}[/white]")
+                            self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                            continue
 
                     # ==========================================
                     # 1. SECURITY INTERCEPTION LAYER
@@ -247,5 +340,35 @@ class Agent:
                     # SAVE RESULT TO MEMORY (Happens for ALL paths)
                     # ==========================================
                     self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+
+                    # ==========================================
+                    # TRACK SEARCH CONTEXT (prevents redundant iterations)
+                    # ==========================================
+                    if tool_call.name == "search_codebase":
+                        # Summarize and cache the search result
+                        query = args.get("query", "")
+                        if query and result and "No functions" not in result:
+                            # Create a concise summary (first 200 chars, avoid full output bloat)
+                            summary = result.replace('\n', ' ')[:200]
+                            # Store exact query and normalized version
+                            self._discovered_context[query.lower()] = summary
+                            # Also store key words as separate lookups for fuzzy match
+                            for word in query.lower().split():
+                                if len(word) > 3:  # Skip short words
+                                    self._discovered_context[f"kw:{word}"] = summary
+                    
+                    elif tool_call.name == "get_codebase_overview":
+                        # Cache the overview summary
+                        dir_arg = args.get("directory", self.working_directory or ".")
+                        if result and "No code symbols" not in result:
+                            # Extract just the file count and key files
+                            summary = result.replace('\n', ' ')[:200]
+                            self._discovered_context[f"overview:{dir_arg}"] = summary
+                    
+                    elif tool_call.name == "get_file_tree":
+                        dir_arg = args.get("directory", self.working_directory or ".")
+                        if result and "not found" not in result.lower():
+                            summary = result[:200]
+                            self._discovered_context[f"tree:{dir_arg}"] = summary
 
                 self.console.print("[dim]⏳ Processing tool results...[/dim]")
