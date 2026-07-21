@@ -26,11 +26,11 @@ class MongoSTM(BaseMemory):
     """Persistent, MongoDB-backed short-term memory, with read-time
     compaction so large tool outputs / tool-call arguments don't get
     re-sent to the LLM at full price on every later turn."""
-    
+
     COMPACT_THRESHOLD_CHARS = 2000
     PROTECT_RECENT = 6
-    # Default: keep 25% of context window as buffer for response generation
-    TOKEN_BUFFER_RATIO = 0.25
+    # Token buffer for response generation (kept low since we have explicit allocations)
+    BUFFER_RATIO = 0.02  # 2% buffer for response generation
 
     def __init__(
         self,
@@ -43,6 +43,7 @@ class MongoSTM(BaseMemory):
         system_prompt: str = "You are a helpful coding assistant. You have access to a shell to run commands. If the user asks you to do something that requires looking at files or running code, use the run_shell_command tool.",
         model: str = "gpt-4o",
         context_window: int = None,
+        memory_allocation: dict = None,
     ):
         self.session_id = session_id
         self.max_messages = max_messages
@@ -51,6 +52,13 @@ class MongoSTM(BaseMemory):
         self.model = model
         # Use provided context_window or fallback to model-specific default
         self.context_window = context_window or MODEL_CONTEXT_WINDOWS.get(model, 128000)
+
+        # Memory allocation: system_prompt + long_term = 25-30%, short_term = 60-70%
+        self.memory_allocation = memory_allocation or {
+            "system_prompt_ratio": 0.28,  # 28% for system prompt (includes LTM injection)
+            "short_term_ratio": 0.65,     # 65% for short-term messages
+            "long_term_ratio": 0.07,      # 7% for long-term memory
+        }
 
         try:
             self.client = MongoClient(mongo_uri, serverSelectionTimeoutMS=5000)
@@ -76,7 +84,7 @@ class MongoSTM(BaseMemory):
             self.encoding = tiktoken.encoding_for_model(model)
         except KeyError:
             self.encoding = tiktoken.get_encoding("cl100k_base")
-        
+
         # Local cache to avoid DB hits for same-turn reads
         self._cache = None
         self._cache_dirty = True
@@ -101,8 +109,8 @@ class MongoSTM(BaseMemory):
         context = self.get_context()
         used_tokens = self._count_tokens(context)
         available_tokens = self.context_window - used_tokens
-        buffer_tokens = int(self.context_window * self.TOKEN_BUFFER_RATIO)
-        
+        buffer_tokens = int(self.context_window * self.BUFFER_RATIO)
+
         return {
             "used": used_tokens,
             "available": max(0, available_tokens - buffer_tokens),
@@ -130,7 +138,7 @@ class MongoSTM(BaseMemory):
         # Use cache if available and not dirty
         if not self._cache_dirty and self._cache is not None:
             return self._cache
-            
+
         doc = self.collection.find_one({"session_id": self.session_id})
         if not doc:
             stm_model = ShortTermMemoryModel(
@@ -159,20 +167,39 @@ class MongoSTM(BaseMemory):
 
         system_msg = Message(role="system", content=stm_model.system_prompt)
         compacted_history = self._compact_for_context(stm_model.messages)
-        
-        # Apply token-based trimming if over budget
-        buffer_tokens = int(self.context_window * self.TOKEN_BUFFER_RATIO)
-        target_tokens = self.context_window - buffer_tokens
-        
+
+        # Apply token-based trimming with allocation strategy
+        # System prompt gets system_prompt_ratio, messages get short_term_ratio
+        system_ratio = self.memory_allocation.get("system_prompt_ratio", 0.28)
+        short_term_ratio = self.memory_allocation.get("short_term_ratio", 0.65)
+        long_term_ratio = self.memory_allocation.get("long_term_ratio", 0.07)
+
+        # Token budgets
+        system_prompt_budget = int(self.context_window * system_ratio)
+        message_tokens_budget = int(self.context_window * short_term_ratio)
+
+        # First trim messages to budget
         compacted_history = self._enforce_token_budget(
-            [system_msg] + compacted_history, 
-            target_tokens
+            compacted_history,
+            message_tokens_budget
         )
-        
+
+        # Check if system prompt + messages fit within allocated budget
+        allocated_for_context = system_prompt_budget + message_tokens_budget
+        total_used = self._count_tokens([system_msg] + compacted_history)
+
+        # If over budget, trim messages further
+        if total_used > allocated_for_context:
+            # Recursively trim until within budget or we hit minimum
+            while total_used > allocated_for_context and len(compacted_history) > 2:
+                # Remove oldest message
+                compacted_history.pop(0)
+                total_used = self._count_tokens([system_msg] + compacted_history)
+
         # Cache the result
         self._cache = compacted_history
         self._cache_dirty = False
-        
+
         return compacted_history
 
     def _enforce_token_budget(self, messages: list[Message], max_tokens: int) -> list[Message]:

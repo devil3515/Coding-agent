@@ -47,25 +47,25 @@ def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegist
     """Create a new agent session with the given configuration."""
     db_conf = config['database']
     memory_config = config.get('memory', {}).get('short_term', {})
-    
+
     # Get model name from LLM config
     model_name = llm_config.get('model', 'gpt-4o') if llm_config else 'gpt-4o'
-    
+
     # Extract model context window from config or use default
     model_context_window = config.get('memory', {}).get('model_context_window', MODEL_CONTEXT_WINDOWS.get(model_name, 128000))
-    
+
     # Memory context budget - leaving 25% for response generation
     # Default is memory_config.max_tokens, but cap at 75% of context window to leave room for response
     memory_max_tokens = config.get('memory', {}).get('short_term', {}).get('max_tokens', 32000)
     memory_max_tokens = min(memory_max_tokens, int(model_context_window * 0.75))  # Max 75% of context window
-    
+
     memory = MongoSTM(
         mongo_uri=db_conf['mongo_uri'],
         db_name=db_conf['db_name'],
         collection_name=db_conf.get('stm_collection', db_conf.get('collection_name', 'short_term_memory')),
         session_id=session_id,
         system_prompt=get_default_prompt(working_dir=working_directory),
-        max_messages=memory_config.get('max_messages', 50),
+        max_messages=memory_config.get('max_messages', 20),
         max_tokens=memory_max_tokens,
         model=model_name,
         context_window=model_context_window
@@ -438,7 +438,7 @@ def main():
             used = usage['used']
             total = usage['total']
             console.print(f"  [dim]{color}{pct:.0f}% filled [{used}/{total} tokens][/dim]")
-        
+
         # Print the input prompt on the same line
         prompt_line = f"[bold cyan]┌[{session_id[:6]}] You:[/bold cyan] "
         console.print(prompt_line, end="")
@@ -448,7 +448,7 @@ def main():
         while True:
             # Get current usage for prompt
             usage = agent.get_context_usage()
-            
+
             # Print input prompt
             print_input_prompt(current_session_id, usage)
             user_input = session.prompt(multiline=True, key_bindings=bindings)
@@ -513,7 +513,7 @@ def main():
                 # Process the user input - show line break after input
                 console.print("")
                 console.print("")
-                
+
                 final_response = agent.chat(user_input, max_iterations=config['agent']['max_iterations'])
 
                 if final_response:
@@ -527,7 +527,7 @@ def main():
                         box=ROUNDED
                     ))
                     console.print("")
-                    
+
                     # Show updated context bar
                     agent.print_context_bar()
                     console.print("")

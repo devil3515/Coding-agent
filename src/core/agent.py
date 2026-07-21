@@ -47,11 +47,11 @@ class Agent:
         usage = self.get_context_usage()
         if not usage:
             return
-        
+
         used = usage['used']
         total = usage['total']
         pct = usage['percentage']
-        
+
         # Color based on usage
         if pct < 50:
             color = "green"
@@ -65,19 +65,19 @@ class Agent:
         else:
             color = "red"
             status_emoji = "🚨"
-        
+
         # Create a visual bar (50 chars wide)
         bar_width = 40
         filled = int((pct / 100) * bar_width)
         empty = bar_width - filled
         bar = "█" * filled + "░" * empty
-        
+
         # Format numbers with K suffix
         def format_tokens(n):
             if n >= 1000:
                 return f"{n/1000:.1f}K"
             return str(n)
-        
+
         self.console.print(
             f"[dim]{status_emoji} Context: [{color}]{bar}[/] "
             f"{format_tokens(used)}/{format_tokens(total)} tokens ({pct:.1f}%)[/dim]"
@@ -122,10 +122,12 @@ class Agent:
             #-- GET CURRENT CONTEXT FROM STM ------------------------------------
             context = self.memory.get_context()
 
-            #-- ADD LTM ---------------------------------------------------------
+            #-- ADD LTM with size tracking --------------------------------------
             if self.ltm and context[0].role == "system":
-                past_context = self.ltm.get_recent_context(limit=5)
-                if past_context:
+                past_context, ltm_token_count = self.ltm.get_recent_context(limit=5)
+                # LTM is injected into system prompt, so it consumes from system budget (28%)
+                # Keep LTM small (max 3000 tokens ~ 30KB) to avoid blowing system prompt budget
+                if past_context and ltm_token_count < 3000:
                     context[0] = Message(
                         role="system",
                         content=f"{context[0].content}\n\n{past_context}"
@@ -138,7 +140,7 @@ class Agent:
                     if not query.startswith("kw:"):  # Skip keyword entries in display
                         search_context_lines.append(f"• '{query}': {summary}")
                 search_context_lines.append("\n⚠️  IMPORTANT: These searches have already been done. USE this context instead of re-searching. If you call search_codebase again for similar queries, you will waste iterations.")
-                
+
                 context[0] = Message(
                     role="system",
                     content=f"{context[0].content}{''.join(search_context_lines)}"
@@ -356,7 +358,7 @@ class Agent:
                             for word in query.lower().split():
                                 if len(word) > 3:  # Skip short words
                                     self._discovered_context[f"kw:{word}"] = summary
-                    
+
                     elif tool_call.name == "get_codebase_overview":
                         # Cache the overview summary
                         dir_arg = args.get("directory", self.working_directory or ".")
@@ -364,7 +366,7 @@ class Agent:
                             # Extract just the file count and key files
                             summary = result.replace('\n', ' ')[:200]
                             self._discovered_context[f"overview:{dir_arg}"] = summary
-                    
+
                     elif tool_call.name == "get_file_tree":
                         dir_arg = args.get("directory", self.working_directory or ".")
                         if result and "not found" not in result.lower():
