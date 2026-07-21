@@ -28,6 +28,57 @@ class Agent:
         self.current_plan: list[dict] = []
         # --- TOUCHED FILES STATE ---
         self.touched_files = set()
+        # --- SEARCH CONTEXT TRACKER (prevents redundant searches) ---
+        self._discovered_context: dict[str, str] = {}  # query -> summary of results
+        # --- SKILL STATE ---
+        self.active_skill_name: str | None = None
+
+    def get_context_usage(self) -> dict:
+        """Get context window usage if memory supports it."""
+        if hasattr(self.memory, 'get_token_usage'):
+            return self.memory.get_token_usage()
+        return None
+
+    def print_context_bar(self):
+        """Print a context window usage bar to the console."""
+        usage = self.get_context_usage()
+        if not usage:
+            return
+
+        used = usage['used']
+        total = usage['total']
+        pct = usage['percentage']
+
+        # Color based on usage
+        if pct < 50:
+            color = "green"
+            status_emoji = "✅"
+        elif pct < 75:
+            color = "yellow"
+            status_emoji = "⚠️"
+        elif pct < 90:
+            color = "orange"
+            status_emoji = "🔶"
+        else:
+            color = "red"
+            status_emoji = "🚨"
+
+        # Create a visual bar (50 chars wide)
+        bar_width = 40
+        filled = int((pct / 100) * bar_width)
+        empty = bar_width - filled
+        bar = "█" * filled + "░" * empty
+
+        # Format numbers with K suffix
+        def format_tokens(n):
+            if n >= 1000:
+                return f"{n/1000:.1f}K"
+            return str(n)
+
+        self.console.print(
+            f"[dim]{status_emoji} Context: [{color}]{bar}[/] "
+            f"{format_tokens(used)}/{format_tokens(total)} tokens ({pct:.1f}%)[/dim]"
+        )
 
     def _print_token_usage(self, response, action_text: str):
         """Helper to format and print token usage cleanly."""
@@ -68,14 +119,29 @@ class Agent:
             #-- GET CURRENT CONTEXT FROM STM ------------------------------------
             context = self.memory.get_context()
 
-            #-- ADD LTM ---------------------------------------------------------
+            #-- ADD LTM with size tracking --------------------------------------
             if self.ltm and context[0].role == "system":
-                past_context = self.ltm.get_recent_context(limit=5)
-                if past_context:
+                past_context, ltm_token_count = self.ltm.get_recent_context(limit=5)
+                # LTM is injected into system prompt, so it consumes from system budget (28%)
+                # Keep LTM small (max 3000 tokens ~ 30KB) to avoid blowing system prompt budget
+                if past_context and ltm_token_count < 3000:
                     context[0] = Message(
                         role="system",
                         content=f"{context[0].content}\n\n{past_context}"
                     )
+
+            #-- INJECT DISCOVERED SEARCH CONTEXT (prevents redundant iterations) --
+            if self._discovered_context and context[0].role == "system":
+                search_context_lines = ["\n\n" + "="*60 + "\n🔍 PREVIOUSLY DISCOVERED CONTEXT (CRITICAL - DO NOT RE-SEARCH)\n" + "="*60 + "\n"]
+                for query, summary in list(self._discovered_context.items())[:10]:  # Limit to 10 entries
+                    if not query.startswith("kw:"):  # Skip keyword entries in display
+                        search_context_lines.append(f"• '{query}': {summary}")
+                search_context_lines.append("\n⚠️  IMPORTANT: These searches have already been done. USE this context instead of re-searching. If you call search_codebase again for similar queries, you will waste iterations.")
+
+                context[0] = Message(
+                    role="system",
+                    content=f"{context[0].content}{''.join(search_context_lines)}"
+                )
 
             #-- INJECT WORKING DIRECTORY ----------------------------------------
             if self.working_directory and context[0].role == "system":
@@ -247,5 +313,35 @@ class Agent:
                     # SAVE RESULT TO MEMORY (Happens for ALL paths)
                     # ==========================================
                     self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+
+                    # ==========================================
+                    # TRACK SEARCH CONTEXT (prevents redundant iterations)
+                    # ==========================================
+                    if tool_call.name == "search_codebase":
+                        # Summarize and cache the search result
+                        query = args.get("query", "")
+                        if query and result and "No functions" not in result:
+                            # Create a concise summary (first 200 chars, avoid full output bloat)
+                            summary = result.replace('\n', ' ')[:200]
+                            # Store exact query and normalized version
+                            self._discovered_context[query.lower()] = summary
+                            # Also store key words as separate lookups for fuzzy match
+                            for word in query.lower().split():
+                                if len(word) > 3:  # Skip short words
+                                    self._discovered_context[f"kw:{word}"] = summary
+
+                    elif tool_call.name == "get_codebase_overview":
+                        # Cache the overview summary
+                        dir_arg = args.get("directory", self.working_directory or ".")
+                        if result and "No code symbols" not in result:
+                            # Extract just the file count and key files
+                            summary = result.replace('\n', ' ')[:200]
+                            self._discovered_context[f"overview:{dir_arg}"] = summary
+
+                    elif tool_call.name == "get_file_tree":
+                        dir_arg = args.get("directory", self.working_directory or ".")
+                        if result and "not found" not in result.lower():
+                            summary = result[:200]
+                            self._discovered_context[f"tree:{dir_arg}"] = summary
 
                 self.console.print("[dim]⏳ Processing tool results...[/dim]")

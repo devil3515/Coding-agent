@@ -29,11 +29,17 @@ class LongTermMemory:
             upsert=True
         )
 
-    def get_recent_context(self, limit: int = 10) -> str:
+    def get_recent_context(self, limit: int = 10) -> tuple[str, int]:
         """
         Fetches the last few session summaries to inject into the system prompt.
-        Returns a formatted string.
+        Returns a tuple of (context_string, token_count).
         """
+        try:
+            import tiktoken
+            encoding = tiktoken.get_encoding("cl100k_base")
+        except:
+            encoding = None
+
         cursor = self.collection.find(
             {},
             {"_id": 0, "session_id": 1, "summary": 1, "updated_at": 1},
@@ -41,7 +47,7 @@ class LongTermMemory:
 
         docs = list(cursor)
         if not docs:
-            return ""
+            return "", 0
 
         models = [
             LongTermMemoryModel(
@@ -55,9 +61,11 @@ class LongTermMemory:
         context_str = "Here is what you remember from previous sessions:\n"
         for m in models:
             context_str += f"- [{m.session_id}]: {m.summary}\n"
-        return context_str
+
+        # Count tokens
+        token_count = len(encoding.encode(context_str)) if encoding else len(context_str) // 4
+        return context_str, token_count
 
     def check_project_in_memory(self, project_id: str) -> bool:
         doc = self.collection.find_one({"project_id": project_id})
         return doc is not None
-        
