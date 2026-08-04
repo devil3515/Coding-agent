@@ -146,7 +146,11 @@ class MongoSTM(BaseMemory):
                 system_prompt=self.system_prompt,
                 messages=[]
             )
-            return [Message(role="system", content=stm_model.system_prompt)]
+            # Return system message for empty sessions
+            system_msg = Message(role="system", content=stm_model.system_prompt)
+            self._cache = [system_msg]
+            self._cache_dirty = False
+            return self._cache
 
         raw_messages = doc.get("messages", [])
         history = []
@@ -172,7 +176,7 @@ class MongoSTM(BaseMemory):
         # System prompt gets system_prompt_ratio, messages get short_term_ratio
         system_ratio = self.memory_allocation.get("system_prompt_ratio", 0.28)
         short_term_ratio = self.memory_allocation.get("short_term_ratio", 0.65)
-        long_term_ratio = self.memory_allocation.get("long_term_ratio", 0.07)
+        # Note: long_term_ratio is reserved for LTM injection in agent.py
 
         # Token budgets
         system_prompt_budget = int(self.context_window * system_ratio)
@@ -196,11 +200,11 @@ class MongoSTM(BaseMemory):
                 compacted_history.pop(0)
                 total_used = self._count_tokens([system_msg] + compacted_history)
 
-        # Cache the result
-        self._cache = compacted_history
+        # Cache the result (include system message at the start)
+        self._cache = [system_msg] + compacted_history
         self._cache_dirty = False
 
-        return compacted_history
+        return self._cache
 
     def _enforce_token_budget(self, messages: list[Message], max_tokens: int) -> list[Message]:
         """Trim messages from the start if over token budget."""
