@@ -124,12 +124,11 @@ class MongoSTM(BaseMemory):
 
         doc = self.collection.find_one({"session_id": self.session_id})
         if not doc:
-            stm_model = ShortTermMemoryModel(
-                session_id=self.session_id,
-                system_prompt=self.system_prompt,
-                messages=[]
-            )
-            return [Message(role="system", content=stm_model.system_prompt)]
+            # Initialize cache for empty sessions
+            system_msg = Message(role="system", content=self.system_prompt)
+            self._cache = [system_msg]
+            self._cache_dirty = False
+            return [system_msg]
 
         raw_messages = doc.get("messages", [])
         history = []
@@ -180,10 +179,10 @@ class MongoSTM(BaseMemory):
                 total_used = self._count_tokens([system_msg] + compacted_history)
 
         # Cache the result
-        self._cache = compacted_history
+        self._cache = [system_msg] + compacted_history
         self._cache_dirty = False
 
-        return compacted_history
+        return [system_msg] + compacted_history
 
     def _enforce_token_budget(self, messages: list[Message], max_tokens: int) -> list[Message]:
         """Trim messages from the start if over token budget."""
