@@ -1,4 +1,5 @@
 import os
+import fnmatch
 from pathlib import Path
 
 MAX_LINES_PER_READ = 500

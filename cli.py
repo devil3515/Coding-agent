@@ -3,6 +3,11 @@ import uuid
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.box import DOUBLE, ROUNDED, HEAVY, SQUARE, MINIMAL
+from rich.syntax import Syntax
+from rich.text import Text
+from rich.markdown import Markdown
+from rich.spinner import Spinner
 import os
 import json
 import asyncio
@@ -20,11 +25,15 @@ from src.memory.project_memory import ProjectMemoryManager
 from src.models import ShortTermMemoryModel, LongTermMemoryModel, ProjectMemoryContent, ProjectMemoryModel
 from src.llm.base import Message
 from src.tools.codebase_graph import search_codebase, get_codebase_overview
-from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree
+from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree, find_files
 from src.tools.planning import create_project_plan, update_project_plan, ask_user_question, update_plan_text
+from src.core.skill_core import load_skill_manager
 from src.tools.git_tools import run_git
+from src.tools.skills import SKILL_TOOLS
+from src.core.parallel_agent import PARALLEL_AGENT_TOOLS
 from prompts.registry import get_default_prompt
 from src.mcp.bridge import MCPBridge
+from src.memory.mongo_stm import MODEL_CONTEXT_WINDOWS
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.history import InMemoryHistory
@@ -34,7 +43,7 @@ app = typer.Typer()
 console = Console()
 
 
-def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegistry, session_id: str, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None) -> Agent:
+def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegistry, session_id: str, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, skill_manager = None) -> Agent:
     """Create a new agent session with the given configuration."""
     db_conf = config['database']
     memory_config = config.get('memory', {}).get('short_term', {})
@@ -61,7 +70,22 @@ def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegist
         model=model_name,
         context_window=model_context_window
     )
-    return Agent(llm=llm, registry=registry, memory=memory, console=console, ltm=ltm, llm_config=llm_config, working_directory=working_directory, session_id=session_id)
+    return Agent(llm=llm, registry=registry, memory=memory, console=console, ltm=ltm, llm_config=llm_config, working_directory=working_directory, session_id=session_id, skill_manager=skill_manager)
+
+
+def print_typing_indicator(session_id: str):
+    """Print a Kimi Code-style typing indicator."""
+    from rich.live import Live
+    from rich.spinner import Spinner
+    spinner = Spinner("dots12", " Thinking...")
+    panel = Panel(
+        spinner,
+        title=f"[bold cyan]Agent [{session_id[:6]}]...",
+        border_style="cyan",
+        padding=(1, 2),
+        box=ROUNDED
+    )
+    return panel
 
 
 
@@ -241,6 +265,15 @@ def main():
         function=ask_user_question
     )
 
+    # Register skill tools
+    for tool_name, tool_config in SKILL_TOOLS.items():
+        registry.register(
+            name=tool_name,
+            description=tool_config["description"],
+            parameters=tool_config["parameters"],
+            function=tool_config["function"]
+        )
+
     #-- CODEBASE OVERVIEW TOOLS ------------------------------------------------
     registry.register(
         name="get_codebase_overview",
@@ -272,6 +305,35 @@ def main():
         },
         function=lambda directory=None, max_depth=4: get_file_tree(directory or working_directory, max_depth)
     )
+
+    registry.register(
+        name="find_files",
+        description=(
+            "Searches for files matching a glob pattern within the project directory. "
+            "Use this to find files by name or pattern when you know roughly what you're looking for. "
+            "Supports patterns like '*.py', '**/models/*.py', 'test_*.py'. "
+            "Returns up to 50 results by default."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Glob pattern to match files (e.g., '*.py', '**/*.md', 'config.{json,yaml}')"},
+                "directory": {"type": "string", "description": "Directory to search in (default: current working directory)"},
+                "max_results": {"type": "integer", "description": "Maximum number of results to return (default: 50, max: 100)"}
+            },
+            "required": ["pattern"]
+        },
+        function=lambda pattern, directory=None, max_results=50: find_files(pattern, directory or working_directory, max_results)
+    )
+
+    # Register parallel agent tools
+    for tool_name, tool_config in PARALLEL_AGENT_TOOLS.items():
+        registry.register(
+            name=tool_name,
+            description=tool_config["description"],
+            parameters=tool_config["parameters"],
+            function=tool_config["function"]
+        )
 
     #-- MCP TOOLS -------------------------------------------------------------
 
@@ -331,23 +393,27 @@ def main():
             updated_at=datetime.utcnow()
         )
 
-    current_session_id = f"session_{uuid.uuid4().hex[:6]}"
-    agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory)
+    # Initialize skill manager
+    skill_manager = load_skill_manager(working_directory)
 
-    # PRINT startup diagnostic panel
+    current_session_id = f"session_{uuid.uuid4().hex[:6]}"
+    agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory, skill_manager=skill_manager)
+
+    # PRINT startup diagnostic panel - Kimi Code style
     diag_msg = (
-        f"[bold cyan]Session ID:[/bold cyan] {current_session_id}\n"
-        f"[bold cyan]LLM Model:[/bold cyan] {config['llm'].get('model', 'Unknown')}\n"
-        f"[bold cyan]MongoDB Status:[/bold cyan] Connected successfully\n"
-        f"[bold cyan]STM Collection:[/bold cyan] {db_conf.get('stm_collection', db_conf.get('collection_name', 'short_term_memory'))}\n"
-        f"[bold cyan]LTM Collection:[/bold cyan] {db_conf.get('ltm_collection', 'long_term_memory')}\n"
-        f"[bold cyan]Project Memory Collection:[/bold cyan] {db_conf.get('project_memory_collection', 'project_memory')}\n"
-        f"[bold cyan]Project Name:[/bold cyan] {project_name} (ID: {project_id})\n"
-        f"[bold cyan]Project Path:[/bold cyan] {abs_path}\n"
-        f"[bold cyan]Project Status:[/bold cyan] {'Recognized (has existing memory)' if project_mem.memory.purpose else 'New (uninitialized memory)'}"
+        f"[bold cyan]Session:[/bold cyan] {current_session_id[:6]}\n"
+        f"[bold magenta]Model:[/bold magenta] {config['llm'].get('model', 'Unknown')}\n"
+        f"[bold green]Mongo:[/bold green] Connected\n"
+        f"[bold yellow]Project:[/bold yellow] {project_name}"
     )
-    console.print(Panel(diag_msg, title="🛠️ Agent Diagnostic Startup", border_style="bold green"))
-    console.print(Panel(f"[bold green]🚀 Agent Ready[/bold green]\n[dim]Type /help for commands. Use Enter to send, and Shift+Enter/Alt+Enter for newlines.[/dim]"))
+    console.print(Panel(diag_msg, title="🤖 Kimi Code Agent", border_style="bold purple", style="bold", padding=(1, 2), box=DOUBLE))
+    console.print(Panel(
+        f"[bold green]Ready! Type your request below.[/bold green]\n"
+        f"Use [bold]/help[/bold] for commands • [bold]/exit[/bold] to quit",
+        border_style="green",
+        padding=(0, 2)
+    ))
+    console.print("")
 
     bindings = KeyBindings()
 
@@ -395,8 +461,8 @@ def main():
 
             elif user_input.lower() == "/new":
                 current_session_id = f"session_{uuid.uuid4().hex[:6]}"
-                agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
-                console.print(f"[bold green]✨ Started new session: {current_session_id}[/bold green]")
+                agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory)
+                console.print(Panel(f"[bold green]✨ Started new session: {current_session_id[:6]}[/bold green]", border_style="green", padding=(0, 1)))
 
             elif user_input.lower() == "/resume":
                 console.print("[bold cyan]Fetching recent sessions...[/bold cyan]")
@@ -406,13 +472,13 @@ def main():
                     console.print("[dim]No previous sessions found.[/dim]")
                     continue
 
-                table = Table(show_header=True, header_style="bold magenta")
+                table = Table(box=MINIMAL, show_header=True, header_style="bold magenta")
                 table.add_column("#", style="dim", width=4)
                 table.add_column("Session ID", style="cyan")
                 table.add_column("Last Updated")
 
                 for i, s in enumerate(sessions):
-                    table.add_row(str(i+1), s['session_id'], str(s.get('updated_at', 'Unknown')))
+                    table.add_row(str(i+1), s['session_id'][:6], str(s.get('updated_at', 'Unknown')).split('.')[0])
 
                 console.print(table)
                 choice = console.input("[bold yellow]Enter session number to resume (or 'c' to cancel): [/bold yellow]")
@@ -425,22 +491,23 @@ def main():
                     if 0 <= idx < len(sessions):
                         selected_id = sessions[idx]['session_id']
                         current_session_id = selected_id
-                        agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
-                        console.print(f"[bold green]♻️  Resumed session: {current_session_id}[/bold green]")
+                        agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory)
+                        console.print(Panel(f"[bold green]♻️  Resumed session: {current_session_id[:6]}[/bold green]", border_style="green", padding=(0, 1)))
                     else:
                         console.print("[bold red]Invalid number.[/bold red]")
                 except ValueError:
                     console.print("[bold red]Please enter a valid number.[/red]")
 
             elif user_input.lower() == "/help":
-                console.print(Panel(
-                    "[bold]/new[/bold] - Start a fresh session\n"
-                    "[bold]/resume[/bold] - Pick a previous session\n"
-                    "[bold]/help[/bold] - Show this menu\n"
-                    "[bold]/exit[/bold] - Quit the agent\n\n"
-                    "[dim]Tip: press Enter twice to send a multi-line message.[/dim]",
-                    title="Commands"
-                ))
+                help_content = "\n".join([
+                    "[bold]/new[/bold]       Start a fresh session",
+                    "[bold]/resume[/bold]    Pick a previous session",
+                    "[bold]/help[/bold]      Show this help menu",
+                    "[bold]/exit[/bold]      Quit the agent",
+                    "",
+                    "[dim]Tip: Press Enter twice to send a multi-line message.[/dim]"
+                ])
+                console.print(Panel(help_content, title="Commands", border_style="cyan", padding=(0, 2)))
 
             else:
                 # Process the user input - show line break after input
@@ -469,57 +536,15 @@ def main():
         console.print("\n[dim yellow]Interrupted by user (Ctrl+C).[/dim yellow]")
 
     finally:
-        # THIS RUNS NO MATTER WHAT (Exit, Ctrl+C, or crash)
-        console.print("[dim]Saving session summary to Long-Term Memory...[/dim]")
-
-        summary_text = "No summary available"
-        try:
-            # Get context but DON'T add the summary prompt to STM
-            context_for_summary = agent.memory.get_context()
-            context_for_summary.append(
-                Message(role="user", content="Summarize the key accomplishments, facts learned, or code changes made in this session in 2-3 sentences.")
-            )
-
-            # Generate summary (no tools allowed during shutdown!)
-            summary_response = llm.complete(
-                context_for_summary,
-                tools=None,
-                max_tokens=config['llm'].get("max_tokens", 6000)
-            )
-            summary_text = summary_response.content
-
-            # Save to LTM
-            ltm.save_session_summary(current_session_id, summary_text)
-            console.print(f"[bold green]✅ Session {current_session_id} saved to long-term memory.[/bold green]")
-        except Exception as e:
-            console.print(f"[bold red]Could not save summary (API might be down): {e}[/bold red]")
-
-        # Update Project Memory
-        console.print("[dim]Updating Project Memory...[/dim]")
-        try:
-            conversation_context = agent.memory.get_context()
-            project_mem = project_mem_mgr.generate_and_update_project_memory(
-                project_mem=project_mem,
-                conversation_context=conversation_context,
-                llm=llm,
-                session_id=current_session_id,
-                session_summary=summary_text,
-                working_directory=working_directory
-            )
-            console.print("[bold green]✅ Project memory saved to MongoDB.[/bold green]")
-            local_mem_file = os.path.join(working_directory, ".agent-memory.json")
-            console.print(f"[bold green]✅ Exported project context to {local_mem_file}[/bold green]")
-        except Exception as e:
-            console.print(f"[bold red]Could not update project memory: {e}[/bold red]")
-
-        if mcp_bridges:
-            console.print("[dim]Shutting down MCP connections...[/dim]")
-            for bridge in mcp_bridges:
-                try:
-                    bridge.sync_disconnect()
-                except Exception:
-                    pass
-        console.print("[bold green]Goodbye![/bold green]")
+        # Print final status panel
+        console.print("")
+        console.print(Panel(
+            "[bold green]Session saved to long-term memory.[/bold green]\n"
+            "[bold green]Project memory updated.[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+            box=MINIMAL
+        ))
 
 
 if __name__ == "__main__":

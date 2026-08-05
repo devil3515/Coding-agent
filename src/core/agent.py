@@ -1,18 +1,20 @@
 import json
 from rich.console import Console
+from rich.progress import Progress, BarColumn, TextColumn
 from src.llm.base import Message
 from src.tools.registery import ToolRegistry
 from src.memory.base import BaseMemory
 from src.memory.long_term import LongTermMemory
 from src.safety.guardrails import is_safe_path, is_shell_safe
 from src.tools.planning import create_project_plan as _create_project_plan
+from src.core.skill_core import SkillManager
 
 class Agent:
     """
     The core reasoning loop of the coding agent.
     Completely decoupled from the CLI.
     """
-    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, session_id: str = None):
+    def __init__(self, llm, registry: ToolRegistry, memory: BaseMemory, console: Console, ltm: LongTermMemory = None, llm_config: dict = None, working_directory: str = None, session_id: str = None, skill_manager: SkillManager = None):
         self.llm = llm
         self.registry = registry
         self.memory = memory
@@ -21,12 +23,13 @@ class Agent:
         self.llm_config = llm_config or {}
         self.working_directory = working_directory
         self.session_id = session_id
+        self.skill_manager = skill_manager or SkillManager()
         # --- TOKEN TRACKING STATE ---
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         # --- PLAN STATE (list of dicts: {title, files, status}) ---
         self.current_plan: list[dict] = []
-        # --- TOUCHED FILES STATE ---
+        # --- TOGGLED FILES STATE ---
         self.touched_files = set()
         # --- SEARCH CONTEXT TRACKER (prevents redundant searches) ---
         self._discovered_context: dict[str, str] = {}  # query -> summary of results
@@ -208,6 +211,32 @@ class Agent:
                         self.console.print(f"[bold red]{result}[/bold red]")
                         self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
                         continue
+
+                    # ==========================================
+                    # 0. PARALLEL AGENT TOOL HANDLING
+                    # ==========================================
+                    parallel_tools = ["dispatch_agents"]
+                    if tool_call.name in parallel_tools:
+                        from src.core.parallel_agent import PARALLEL_AGENT_TOOLS
+                        if tool_call.name in PARALLEL_AGENT_TOOLS:
+                            result = PARALLEL_AGENT_TOOLS[tool_call.name]["function"](**args)
+                            self.console.print(f"[bold cyan]🔧 Parallel Agent:[/bold cyan] [magenta]{tool_call.name}[/magenta]")
+                            self.console.print(f"[white]   Result: {result}[/white]")
+                            self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                            continue
+
+                    # ==========================================
+                    # 1. SKILL TOOL HANDLING
+                    # ==========================================
+                    skill_tools = ["activate_skill", "complete_skill", "list_skills", "get_active_skill"]
+                    if tool_call.name in skill_tools:
+                        from src.tools.skills import SKILL_TOOLS
+                        if tool_call.name in SKILL_TOOLS:
+                            result = SKILL_TOOLS[tool_call.name]["function"](**args)
+                            self.console.print(f"[bold cyan]🔧 Skill Tool:[/bold cyan] [magenta]{tool_call.name}[/magenta]")
+                            self.console.print(f"[white]   Result: {result}[/white]")
+                            self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                            continue
 
                     # ==========================================
                     # 1. SECURITY INTERCEPTION LAYER
