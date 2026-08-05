@@ -33,6 +33,14 @@ memory:
     max_tokens: 15000             # rolling window kept in MongoDB
   long_term:
     backend: "local"              # currently only "local" (MongoDB) is supported
+  
+  # Sprint 1 Memory Management Features (Feature Flag)
+  sprint1:
+    enabled: false                # Set to true to enable Sprint 1 features
+    redact_secrets: true          # Redact secrets before persisting to memory
+    checkpoint_every_step: true   # Save checkpoint after each agent step
+    max_checkpoint_observation_chars: 2000  # Max chars for checkpoint observations
+    max_recent_turns_in_context: 12  # Max recent turns to include in context
 
 # ── Agent Core Configuration ─────────────────────────────────────────────────
 agent:
