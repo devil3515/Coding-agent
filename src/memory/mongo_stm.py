@@ -6,6 +6,19 @@ from src.llm.base import Message, ToolCall
 from pymongo import MongoClient
 from src.models import ShortTermMemoryModel
 import tiktoken
+MODEL_CONTEXT_WINDOWS = {
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4": 8192,
+    "o1-preview": 128000,
+    "o1-mini": 128000,
+    "claude-3-5-sonnet": 200000,
+    "claude-3-opus": 200000,
+    "gemini-1.5-pro": 2000000,
+    "gemini-1.5-flash": 1000000,
+}
+
 
 class MongoSTM(BaseMemory):
     """Persistent, MongoDB-backed short-term memory, with read-time
@@ -97,9 +110,6 @@ class MongoSTM(BaseMemory):
             "model": self.model,
         }
 
-    # ------------------------------------------------------------------
-    # Write path — messages are added to the DB here.
-    # ------------------------------------------------------------------
     def add_message(self, message: Message):
         """Write message to DB and invalidate the read cache."""
         msg_dict = asdict(message)
@@ -110,17 +120,12 @@ class MongoSTM(BaseMemory):
         )
         self._cache_dirty = True
 
-    # ------------------------------------------------------------------
-    # Read path — compaction happens HERE, on the way out to the LLM.
-    # ------------------------------------------------------------------
     def get_context(self) -> list[Message]:
-        # Use cache if available and not dirty
         if not self._cache_dirty and self._cache is not None:
             return list(self._cache)
 
         doc = self.collection.find_one({"session_id": self.session_id})
         if not doc:
-            # Initialize cache for empty sessions
             system_msg = Message(role="system", content=self.system_prompt)
             self._cache = [system_msg]
             self._cache_dirty = False
@@ -165,7 +170,6 @@ class MongoSTM(BaseMemory):
                 compacted_history.pop(0)
                 total_used = self._count_tokens([system_msg] + compacted_history)
 
-        # FIX 3: Cache the result, then return a copy
         self._cache = [system_msg] + compacted_history
         self._cache_dirty = False
         return list(self._cache)
