@@ -4,7 +4,7 @@ import time
 from typing import Callable, Any, Optional
 from pydantic import BaseModel, ValidationError
 
-from audit.logger import AuditLogger
+from src.audit.logger import AuditLogger
 
 
 class ToolRegistry:
