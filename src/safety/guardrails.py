@@ -3,9 +3,9 @@ import re
 from pathlib import Path
 
 DANGEROUS_SHELL_PATTERNS = [
-    r'\brm\s+-[rf]+\s+',
-    r'\bdel\s+/[fFsS]+\s+[A-Z]:',
-    r'\brmdir\s+/[sS]+\s+[A-Z]:',
+    r'\brm\b.*(?:\s+|["\'`\\])(?:/|~)',
+    r'\bdel\b.*(?:\s+|["\'`\\/])(?:[a-zA-Z]:|[\\/])',
+    r'\brmdir\b.*(?:\s+|["\'`\\/])(?:[a-zA-Z]:|[\\/])',
     r'\bformat\b',
     r'\bmkfs\b',
     r'\bsudo\b\s+rm\b',
@@ -13,7 +13,7 @@ DANGEROUS_SHELL_PATTERNS = [
     r'\breg\s+delete',
     r'\bcurl\b.*\|.*\bsh\b',
     r'\bwget\b.*\|.*\bsh\b',
-    r'\bnc\b\s+-[el]+\b',
+    r'\bnc\b\s+-[a-zA-Z]*[el][a-zA-Z]*\b',
     r'\bpython[23]?\s+-c\b',
     r'\beval\b',
 ]

@@ -24,6 +24,8 @@ def search_codebase(query: str, project_dir: str = ".") -> str:
 
         #1. Find nodes matching the query
         matched_nodes = _graph_cache.get_node(query)
+        if matched_nodes:
+            matched_nodes = [n for n in matched_nodes if "parallel_agent.py" not in getattr(n, "file_path", "")]
 
         if not matched_nodes:
             return f"No functions, classes, or variables found matching '{query}'."
@@ -68,6 +70,8 @@ def get_codebase_overview(project_dir: str = ".") -> str:
         # Sort files and symbols within each file by line number
         lines = [f"=== Codebase Overview ({len(files)} files, {len(_graph_cache.nodes)} symbols) ===\n"]
         for file_path in sorted(files.keys()):
+            if "parallel_agent.py" in file_path:
+                continue
             nodes = sorted(files[file_path], key=lambda n: n.line_number)
             lines.append(file_path)
             for node in nodes:

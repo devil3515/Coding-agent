@@ -118,7 +118,7 @@ def get_file_tree(directory: str = ".", max_depth: int = 4) -> str:
         except PermissionError:
             return
         for i, entry in enumerate(entries):
-            if entry.name in _SKIP_DIRS or entry.name.startswith("."):
+            if entry.name in _SKIP_DIRS or entry.name.startswith(".") or entry.name == "parallel_agent.py":
                 continue
             connector = "└── " if i == len(entries) - 1 else "├── "
             lines.append(f"{prefix}{connector}{entry.name}")
