@@ -3,6 +3,8 @@ import uuid
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+from rich.markdown import Markdown
+from rich.box import ROUNDED
 import os
 import json
 import asyncio
@@ -11,10 +13,10 @@ from datetime import datetime
 from dataclasses import asdict
 from src.config.settings import load_settings
 from src.llm.openai_provider import OpenAIProvider
-from src.tools.registery import ToolRegistry
+from src.tools.registry import ToolRegistry
 from src.tools.shell import run_shell_command
 from src.core.agent import Agent
-from src.memory.mongo_stm import MongoSTM
+from src.memory.mongo_stm import MongoSTM, MODEL_CONTEXT_WINDOWS
 from src.memory.long_term import LongTermMemory
 from src.memory.project_memory import ProjectMemoryManager
 from src.models import ShortTermMemoryModel, LongTermMemoryModel, ProjectMemoryContent, ProjectMemoryModel
@@ -25,6 +27,8 @@ from src.tools.planning import create_project_plan, update_project_plan, ask_use
 from src.tools.git_tools import run_git
 from prompts.registry import get_default_prompt
 from src.mcp.bridge import MCPBridge
+from src.audit.logger import AuditLogger
+from src.tools import schemas
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.history import InMemoryHistory
@@ -57,7 +61,6 @@ def create_agent_session(config: dict, llm: OpenAIProvider, registry: ToolRegist
         session_id=session_id,
         system_prompt=get_default_prompt(working_dir=working_directory),
         max_messages=memory_config.get('max_messages', 20),
-        max_tokens=memory_max_tokens,
         model=model_name,
         context_window=model_context_window
     )
@@ -69,9 +72,13 @@ def main():
     config = load_settings()
     llm = OpenAIProvider(config['llm'])
     db_conf = config['database']
-    registry = ToolRegistry()
     working_directory = os.getcwd()
     abs_path = os.path.abspath(working_directory)
+    audit = AuditLogger()
+    registry = ToolRegistry(
+        audit_logger=audit,
+        working_directory=working_directory,
+    )
 
     project_id = hashlib.sha256(abs_path.encode()).hexdigest()[:16]
 
@@ -90,7 +97,8 @@ def main():
             },
             "required": ["command"]
         },
-        function=run_shell_command
+        function=run_shell_command,
+        pydantic_schema=schemas.RunShellCommandArgs
     )
 
     #-- CODEBASE SEARCH TOOL ---------------------------------------------------
@@ -107,7 +115,8 @@ def main():
             },
             "required": ["query"]
         },
-        function=search_codebase
+        function=search_codebase,
+        pydantic_schema=schemas.SearchCodebaseArgs
     )
 
     #-- FILE TOOLS -------------------------------------------------------------
@@ -123,7 +132,8 @@ def main():
             },
             "required": ["file_path"]
         },
-        function=read_file
+        function=read_file,
+        pydantic_schema=schemas.ReadFileArgs
     )
 
     registry.register(
@@ -137,7 +147,8 @@ def main():
             },
             "required": ["file_path", "content"]
         },
-        function=write_file
+        function=write_file,
+        pydantic_schema=schemas.WriteFileArgs
     )
 
     #-- APPLY DIFF TOOL --------------------------------------------------------
@@ -153,7 +164,8 @@ def main():
             },
             "required": ["file_path", "old_string", "new_string"]
         },
-        function=apply_diff
+        function=apply_diff,
+        pydantic_schema=schemas.ApplyDiffArgs
     )
 
     #-- GIT TOOLS -------------------------------------------------------------
@@ -167,7 +179,8 @@ def main():
             },
             "required": ["args"]
         },
-        function=run_git
+        function=run_git,
+        pydantic_schema=schemas.RunGitArgs
     )
 
     #-- PROJECT PLAN TOOLS -----------------------------------------------------
@@ -195,7 +208,8 @@ def main():
             },
             "required": ["steps"]
         },
-        function=create_project_plan
+        function=create_project_plan,
+        pydantic_schema=schemas.CreateProjectPlanArgs
     )
 
     registry.register(
@@ -209,7 +223,8 @@ def main():
             },
             "required": ["step_number", "status"]
         },
-        function=update_project_plan
+        function=update_project_plan,
+        pydantic_schema=schemas.UpdatePlanStatusArgs
     )
 
     registry.register(
@@ -223,7 +238,8 @@ def main():
             },
             "required": ["step_number", "new_text"]
         },
-        function=update_plan_text
+        function=update_plan_text,
+        pydantic_schema=schemas.UpdatePlanTextArgs
     )
 
     registry.register(
@@ -238,7 +254,8 @@ def main():
             },
             "required": ["question"]
         },
-        function=ask_user_question
+        function=ask_user_question,
+        pydantic_schema=schemas.AskUserQuestionArgs
     )
 
     #-- CODEBASE OVERVIEW TOOLS ------------------------------------------------
@@ -254,7 +271,8 @@ def main():
                 "directory": {"type": "string", "description": "Directory to index. Defaults to the current working directory."}
             }
         },
-        function=lambda directory=None: get_codebase_overview(directory or working_directory)
+        function=lambda directory=None: get_codebase_overview(directory if (directory and directory != ".") else working_directory),
+        pydantic_schema=schemas.GetCodebaseOverviewArgs
     )
 
     registry.register(
@@ -270,7 +288,8 @@ def main():
                 "max_depth":  {"type": "integer", "description": "Max folder depth (default 4)."}
             }
         },
-        function=lambda directory=None, max_depth=4: get_file_tree(directory or working_directory, max_depth)
+        function=lambda directory=None, max_depth=4: get_file_tree(directory if (directory and directory != ".") else working_directory, max_depth),
+        pydantic_schema=schemas.GetFileTreeArgs
     )
 
     #-- MCP TOOLS -------------------------------------------------------------
@@ -332,6 +351,7 @@ def main():
         )
 
     current_session_id = f"session_{uuid.uuid4().hex[:6]}"
+    registry.session_id = current_session_id
     agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory=working_directory)
 
     # PRINT startup diagnostic panel
@@ -395,6 +415,7 @@ def main():
 
             elif user_input.lower() == "/new":
                 current_session_id = f"session_{uuid.uuid4().hex[:6]}"
+                registry.session_id = current_session_id
                 agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
                 console.print(f"[bold green]✨ Started new session: {current_session_id}[/bold green]")
 
@@ -425,6 +446,7 @@ def main():
                     if 0 <= idx < len(sessions):
                         selected_id = sessions[idx]['session_id']
                         current_session_id = selected_id
+                        registry.session_id = current_session_id
                         agent = create_agent_session(config, llm, registry, current_session_id, ltm, config['llm'], working_directory = working_directory)
                         console.print(f"[bold green]♻️  Resumed session: {current_session_id}[/bold green]")
                     else:

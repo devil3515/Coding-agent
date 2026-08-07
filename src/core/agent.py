@@ -1,7 +1,7 @@
 import json
 from rich.console import Console
 from src.llm.base import Message
-from src.tools.registery import ToolRegistry
+from src.tools.registry import ToolRegistry
 from src.memory.base import BaseMemory
 from src.memory.long_term import LongTermMemory
 from src.safety.guardrails import is_safe_path, is_shell_safe

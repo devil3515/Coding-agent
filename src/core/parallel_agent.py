@@ -12,7 +12,7 @@ from typing import Optional, Dict, List, Any, Callable
 from dataclasses import dataclass, field
 from rich.console import Console
 from src.llm.openai_provider import OpenAIProvider
-from src.tools.registery import ToolRegistry
+from src.tools.registry import ToolRegistry
 from src.memory.base import BaseMemory
 from src.memory.long_term import LongTermMemory
 from src.core.agent import Agent
