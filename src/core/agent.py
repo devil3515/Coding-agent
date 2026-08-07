@@ -171,7 +171,7 @@ class Agent:
                     is_safe = True
                     block_reason = ""
 
-                    if tool_call.name in ["read_file", "write_file", "apply_diff", "search_codebase"]:
+                    if tool_call.name in ["read_file", "write_file", "apply_diff"]:
                         file_path = args.get("file_path", "")
                         is_safe, block_reason = is_safe_path(file_path, self.working_directory)
 

@@ -97,7 +97,7 @@ def main():
             },
             "required": ["command"]
         },
-        function=run_shell_command,
+        function=lambda command: run_shell_command(command, working_directory=working_directory),
         pydantic_schema=schemas.RunShellCommandArgs
     )
 
@@ -115,7 +115,7 @@ def main():
             },
             "required": ["query"]
         },
-        function=search_codebase,
+        function=lambda query, project_dir=None: search_codebase(query, project_dir if (project_dir and project_dir != ".") else working_directory),
         pydantic_schema=schemas.SearchCodebaseArgs
     )
 
@@ -179,7 +179,7 @@ def main():
             },
             "required": ["args"]
         },
-        function=run_git,
+        function=lambda args: run_git(args, working_directory=working_directory),
         pydantic_schema=schemas.RunGitArgs
     )
 
