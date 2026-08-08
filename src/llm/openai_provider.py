@@ -1,7 +1,7 @@
 import os
 import json
-from typing import Any, Generator
-from openai import OpenAI
+from typing import Any, Generator, AsyncGenerator
+from openai import OpenAI, AsyncOpenAI
 from .base import LLMProvider, LLMResponse, Message, ToolCall
 
 class OpenAIProvider(LLMProvider):
@@ -9,11 +9,11 @@ class OpenAIProvider(LLMProvider):
 
     def __init__(self, config: dict):
         self.model = config.get("model", "gpt-4o-mini")
-        api_key= config.get("api_key", os.getenv("OPENAI_API_KEY"))
-        self.client = OpenAI(
-            base_url = config.get("base_url"),
-            api_key=api_key,
-        )
+        api_key = config.get("api_key", os.getenv("OPENAI_API_KEY"))
+        base_url = config.get("base_url")
+
+        self.client = OpenAI(base_url=base_url, api_key=api_key)
+        self.async_client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     def _format_messages(self, messages: list[Message]) -> list[dict]:
         """Translates internal Message dataclass → OpenAI dict format"""
@@ -45,19 +45,7 @@ class OpenAIProvider(LLMProvider):
             formatted.append(msg_dict)
         return formatted
 
-    def complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
-        openai_messages = self._format_messages(messages)
-
-        create_kwargs = {
-            "model": self.model,
-            "messages": openai_messages,
-            "temperature": kwargs.get("temperature", 0.7),
-            "max_tokens": kwargs.get("max_tokens", 2048),
-        }
-        if tools:
-            create_kwargs["tools"] = tools
-
-        response = self.client.chat.completions.create(**create_kwargs)
+    def _parse_response(self, response) -> LLMResponse:
         choice = response.choices[0]
 
         tool_calls = []
@@ -83,6 +71,37 @@ class OpenAIProvider(LLMProvider):
             output_tokens = response.usage.completion_tokens,
         )
 
+    def complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        openai_messages = self._format_messages(messages)
+
+        create_kwargs = {
+            "model": self.model,
+            "messages": openai_messages,
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 2048),
+        }
+        if tools:
+            create_kwargs["tools"] = tools
+
+        response = self.client.chat.completions.create(**create_kwargs)
+        return self._parse_response(response)
+
+    async def async_complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        """Asynchronous completion."""
+        openai_messages = self._format_messages(messages)
+        create_kwargs = {
+            "model": self.model,
+            "messages": openai_messages,
+            "temperature": kwargs.get("temperature", 0.7),
+            "max_tokens": kwargs.get("max_tokens", 2048),
+        }
+        if tools:
+            create_kwargs["tools"] = tools
+
+        response = await self.async_client.chat.completions.create(**create_kwargs)
+        return self._parse_response(response)
+
+
     def stream(self, messages: list[Message], **kwargs: Any) -> Generator[LLMResponse, None, None]:
         openai_messages = self._format_messages(messages)
         stream = self.client.chat.completions.create(
@@ -91,5 +110,18 @@ class OpenAIProvider(LLMProvider):
             stream=True
         )
         for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+
+    async def async_stream(self, messages: list[Message], **kwargs: Any) -> AsyncGenerator[str, None]:
+        """Asynchronous stream."""
+        openai_messages = self._format_messages(messages)
+        stream = await self.async_client.chat.completions.create(
+            model=self.model,
+            messages=openai_messages,
+            stream=True
+        )
+        async for chunk in stream:
             if chunk.choices[0].delta.content:
                 yield chunk.choices[0].delta.content

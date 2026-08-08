@@ -1,6 +1,6 @@
 import os
-from typing import Any, Generator
-from anthropic import Anthropic
+from typing import Any, Generator, AsyncGenerator
+from anthropic import Anthropic, AsyncAnthropic
 from .base import LLMProvider, LLMResponse, Message, ToolCall
 
 
@@ -11,6 +11,9 @@ class AnthropicProvider(LLMProvider):
         self.model = config.get("model", "claude-3-5-sonnet-20241022")
         api_key = config.get("api_key", os.getenv("ANTHROPIC_API_KEY"))
         self.client = Anthropic(
+            api_key=api_key,
+        )
+        self.async_client = AsyncAnthropic(
             api_key=api_key,
         )
         self.default_temperature = config.get("temperature", 0.7)
@@ -63,35 +66,7 @@ class AnthropicProvider(LLMProvider):
             })
         return formatted_tools
 
-    def complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
-        # Separate system messages from regular messages
-        system_message = None
-        formatted_messages = []
-
-        for m in messages:
-            if m.role == "system":
-                system_message = m.content
-            else:
-                formatted_messages.append(m)
-
-        # Format messages for Anthropic
-        anthropic_messages = self._format_messages(formatted_messages)
-
-        # Build API kwargs
-        create_kwargs = {
-            "model": kwargs.get("model", self.model),
-            "messages": anthropic_messages,
-            "temperature": kwargs.get("temperature", self.default_temperature),
-            "max_tokens": kwargs.get("max_tokens", self.default_max_tokens),
-            "system": system_message,
-        }
-
-        if tools:
-            create_kwargs["tools"] = self._format_tools(tools)
-
-        response = self.client.messages.create(**create_kwargs)
-
-        # Parse response
+    def _parse_response(self, response) -> LLMResponse:
         content = None
         tool_calls = []
         thinking = None
@@ -122,6 +97,64 @@ class AnthropicProvider(LLMProvider):
             output_tokens=response.usage.output_tokens,
         )
 
+    def complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        # Separate system messages from regular messages
+        system_message = None
+        formatted_messages = []
+
+        for m in messages:
+            if m.role == "system":
+                system_message = m.content
+            else:
+                formatted_messages.append(m)
+
+        # Format messages for Anthropic
+        anthropic_messages = self._format_messages(formatted_messages)
+
+        # Build API kwargs
+        create_kwargs = {
+            "model": kwargs.get("model", self.model),
+            "messages": anthropic_messages,
+            "temperature": kwargs.get("temperature", self.default_temperature),
+            "max_tokens": kwargs.get("max_tokens", self.default_max_tokens),
+            "system": system_message,
+        }
+
+        if tools:
+            create_kwargs["tools"] = self._format_tools(tools)
+
+        response = self.client.messages.create(**create_kwargs)
+        return self._parse_response(response)
+
+    async def async_complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        # Separate system messages from regular messages
+        system_message = None
+        formatted_messages = []
+
+        for m in messages:
+            if m.role == "system":
+                system_message = m.content
+            else:
+                formatted_messages.append(m)
+
+        # Format messages for Anthropic
+        anthropic_messages = self._format_messages(formatted_messages)
+
+        # Build API kwargs
+        create_kwargs = {
+            "model": kwargs.get("model", self.model),
+            "messages": anthropic_messages,
+            "temperature": kwargs.get("temperature", self.default_temperature),
+            "max_tokens": kwargs.get("max_tokens", self.default_max_tokens),
+            "system": system_message,
+        }
+
+        if tools:
+            create_kwargs["tools"] = self._format_tools(tools)
+
+        response = await self.async_client.messages.create(**create_kwargs)
+        return self._parse_response(response)
+
     def stream(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> Generator[LLMResponse, None, None]:
         # Separate system messages from regular messages
         system_message = None
@@ -148,6 +181,39 @@ class AnthropicProvider(LLMProvider):
 
         with self.client.messages.stream(**create_kwargs) as stream:
             for text_delta in stream.text_stream:
+                if text_delta:
+                    yield LLMResponse(
+                        content=text_delta,
+                        tool_calls=[],
+                        stop_reason="streaming",
+                    )
+
+    async def async_stream(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> AsyncGenerator[LLMResponse, None]:
+        # Separate system messages from regular messages
+        system_message = None
+        formatted_messages = []
+
+        for m in messages:
+            if m.role == "system":
+                system_message = m.content
+            else:
+                formatted_messages.append(m)
+
+        anthropic_messages = self._format_messages(formatted_messages)
+
+        create_kwargs = {
+            "model": kwargs.get("model", self.model),
+            "messages": anthropic_messages,
+            "temperature": kwargs.get("temperature", self.default_temperature),
+            "max_tokens": kwargs.get("max_tokens", self.default_max_tokens),
+            "system": system_message,
+        }
+
+        if tools:
+            create_kwargs["tools"] = self._format_tools(tools)
+
+        async with self.async_client.messages.stream(**create_kwargs) as stream:
+            async for text_delta in stream.text_stream:
                 if text_delta:
                     yield LLMResponse(
                         content=text_delta,

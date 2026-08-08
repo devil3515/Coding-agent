@@ -1,6 +1,7 @@
-"""Tool registry with Pydantic validation and audit logging."""
+"""Tool registry with Pydantic validation, audit logging, and async support."""
 import json
 import time
+import inspect
 from typing import Callable, Any, Optional
 from pydantic import BaseModel, ValidationError
 
@@ -10,7 +11,8 @@ from src.audit.logger import AuditLogger
 class ToolRegistry:
     """
     Registers tools, validates arguments with Pydantic, and logs every
-    execution to an append-only audit trail.
+    execution to an append-only audit trail. Supports both sync and async
+    tool functions.
     """
 
     def __init__(
@@ -48,11 +50,10 @@ class ToolRegistry:
             self.pydantic_schemas[name] = pydantic_schema
 
     def execute(self, tool_name: str, arguments: dict) -> str:
-        """Executes a tool by name with validation and audit logging."""
+        """Synchronous tool execution with validation and audit logging."""
         if tool_name not in self.tools:
             return f"Error: Tool '{tool_name}' not found."
 
-        # ---- 1. PYDANTIC VALIDATION ----
         if tool_name in self.pydantic_schemas:
             try:
                 validated = self.pydantic_schemas[tool_name](**arguments)
@@ -60,7 +61,6 @@ class ToolRegistry:
             except ValidationError as e:
                 return f"Error: Invalid arguments for '{tool_name}': {e}"
 
-        # ---- 2. EXECUTE WITH TIMING ----
         start_time = time.perf_counter()
         try:
             result = self.tools[tool_name](**arguments)
@@ -69,7 +69,44 @@ class ToolRegistry:
 
         duration_ms = (time.perf_counter() - start_time) * 1000
 
-        # ---- 3. AUDIT LOG ----
+        if self.audit_logger:
+            self.audit_logger.log_tool_call(
+                session_id=self.session_id,
+                tool_name=tool_name,
+                arguments=arguments,
+                result=result,
+                duration_ms=duration_ms,
+                working_directory=self.working_directory,
+            )
+
+        return str(result)
+
+    async def aexecute(self, tool_name: str, arguments: dict) -> str:
+        """Asynchronous tool execution with validation and audit logging.
+
+        Automatically detects if the registered function returns an awaitable
+        (coroutine) and awaits it; otherwise calls it synchronously.
+        """
+        if tool_name not in self.tools:
+            return f"Error: Tool '{tool_name}' not found."
+
+        if tool_name in self.pydantic_schemas:
+            try:
+                validated = self.pydantic_schemas[tool_name](**arguments)
+                arguments = validated.model_dump()
+            except ValidationError as e:
+                return f"Error: Invalid arguments for '{tool_name}': {e}"
+
+        start_time = time.perf_counter()
+        try:
+            result = self.tools[tool_name](**arguments)
+            if inspect.isawaitable(result):
+                result = await result
+        except Exception as e:
+            result = f"Error executing tool: {str(e)}"
+
+        duration_ms = (time.perf_counter() - start_time) * 1000
+
         if self.audit_logger:
             self.audit_logger.log_tool_call(
                 session_id=self.session_id,

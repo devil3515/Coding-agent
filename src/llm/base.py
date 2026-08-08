@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Generator, Any
+from typing import Generator, Any, AsyncGenerator
 from dataclasses import dataclass, field
 
 @dataclass
@@ -50,4 +50,14 @@ class LLMProvider(ABC):
     @abstractmethod
     def stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> Generator[str, None, None]:
         """Stream the response from the LLM."""
+        ...
+
+    @abstractmethod
+    def async_complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> LLMResponse:
+        """Async version of complete """
+        ...
+
+    @abstractmethod
+    def async_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncGenerator[str, None]:
+        """Asynchronous stream from the LLM."""
         ...

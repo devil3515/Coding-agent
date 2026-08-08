@@ -94,7 +94,7 @@ class Agent:
         self.console.print(token_str)
         self.console.print(f"[dim]{action_text}[/dim]")
 
-    def chat(self, user_input: str, max_iterations: int = 10) -> str | None:
+    async def chat(self, user_input: str, max_iterations: int = 10) -> str | None:
         """
         Takes user input, runs the agent loop, and returns the final text response.
         Builds a fresh system prompt every turn without mutating the memory cache.
@@ -115,7 +115,7 @@ class Agent:
                     content="You have looped too many times. Please provide your final summary based on what you know."
                 ))
                 context = self._build_context()
-                final_response = self.llm.complete(
+                final_response = await self.llm.async_complete(
                     context,
                     tools=None,
                     max_tokens=self.llm_config.get("max_tokens", 6000)
@@ -129,7 +129,7 @@ class Agent:
 
             #-- ASK LLM ---------------------------------------------------------
             try:
-                response = self.llm.complete(
+                response = await self.llm.async_complete(
                     context,
                     tools=self.registry.schemas,
                     max_tokens=self.llm_config.get("max_tokens", 6000)
@@ -285,6 +285,7 @@ class Agent:
                     elif tool_call.name == "get_file_tree":
                         dir_arg = args.get("directory", self.working_directory or ".")
                         if result and "not found" not in result.lower():
+                            summary = result.replace('\n', ' ')[:200]
                             self._discovered_context[f"tree:{dir_arg}"] = summary
 
                 self.console.print("[dim]⏳ Processing tool results...[/dim]")
