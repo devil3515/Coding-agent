@@ -5,6 +5,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.markdown import Markdown
+from rich.text import Text
 from rich.box import ROUNDED
 import os
 import json
@@ -401,14 +402,29 @@ async def async_main():
     session = PromptSession(history=InMemoryHistory(), auto_suggest=None)
 
     def print_input_prompt(session_id: str, usage: dict = None):
+        """Print the user input prompt with optional context usage."""
         if usage:
             pct = usage["percentage"]
-            color = "green" if pct < 50 else "yellow" if pct < 90 else "red"
             used = usage["used"]
             total = usage["total"]
-            console.print(f" [dim]{color}{pct:.0f}% filled [{used}/{total} tokens][/dim]")
-        prompt_line = f"[bold cyan]┌[{session_id[:6]}] You:[/bold cyan] "
-        console.print(prompt_line, end="")
+
+            if pct < 50:
+                color = "green"
+            elif pct < 75:
+                color = "yellow"
+            elif pct < 90:
+                color = "orange3"
+            else:
+                color = "red"
+
+            # Use Rich Text for proper color handling
+            text = Text()
+            text.append("  ", style="dim")
+            text.append(f"{pct:.0f}% filled ", style=color)
+            text.append(f"[{used:,}/{total:,} tokens]", style="dim")
+            console.print(text)
+
+        console.print(f"[bold cyan]┌[{session_id[:6]}] You:[/bold cyan] ", end="")
 
     try:
         while True:
@@ -522,7 +538,7 @@ async def async_main():
                 )
             )
 
-            summary_response = await llm.async_complete(
+            summary_response = await llm.acomplete(
                 context_for_summary,
                 tools=None,
                 max_tokens=config["llm"].get("max_tokens", 6000),
@@ -549,7 +565,7 @@ async def async_main():
             local_mem_file = os.path.join(working_directory, ".agent-memory.json")
             console.print(f"[bold green]✅ Exported project context to {local_mem_file}[/bold green]")
         except Exception as e:
-            console.print(f"[bold red]Could not update project memory: {e}[/bold red]")
+            console.print(f"[bold red]Could not update project memory: {e}[/red]")
 
         if mcp_bridges:
             console.print("[dim]Shutting down MCP connections...[/dim]")
