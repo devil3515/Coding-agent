@@ -1,3 +1,4 @@
+"""Async core reasoning loop of the coding agent with phase-based state machine."""
 import json
 import asyncio
 from rich.console import Console
@@ -8,12 +9,19 @@ from src.memory.base import BaseMemory
 from src.memory.long_term import LongTermMemory
 from src.safety.guardrails import is_safe_path, is_shell_safe
 from src.tools.planning import create_project_plan as _create_project_plan
+from src.core.state import (
+    AgentPhase,
+    is_tool_allowed,
+    PhaseTransition,
+    format_phase_banner,
+    get_allowed_tools,
+)
 
 
 class Agent:
     """
     The core reasoning loop of the coding agent.
-    Completely decoupled from the CLI. Now fully async.
+    Now with phase-based state machine for plan enforcement.
     """
 
     def __init__(
@@ -43,8 +51,15 @@ class Agent:
         # --- PLAN STATE ---
         self.current_plan: list[dict] = []
 
+        # --- PHASE STATE ---
+        self.phase = AgentPhase.IDLE
+
         # --- TOUCHED FILES STATE ---
         self.touched_files = set()
+
+        # --- PENDING VERIFICATION ---
+        # Files written this turn that need auto-verification
+        self._pending_verification: list[str] = []
 
         # --- SEARCH CONTEXT TRACKER ---
         self._discovered_context: dict[str, str] = {}
@@ -56,7 +71,6 @@ class Agent:
         """Local token counter using tiktoken if available."""
         if hasattr(self.memory, "_count_tokens"):
             return self.memory._count_tokens(messages)
-        # Fallback: rough estimate (~4 chars per token)
         total = 0
         for m in messages:
             if m.content:
@@ -67,20 +81,14 @@ class Agent:
         return total
 
     def get_context_usage(self) -> dict:
-        """
-        Get context window usage based on the ACTUAL context that will be
-        sent to the LLM (including injected system prompt sections).
-        """
+        """Get context window usage based on the ACTUAL context sent to LLM."""
         actual_context = self._build_context()
         used_tokens = self._count_tokens(actual_context)
-
         context_window = 128000
         if hasattr(self.memory, "context_window"):
             context_window = self.memory.context_window
-
         available_tokens = context_window - used_tokens
         buffer_tokens = int(context_window * 0.02)
-
         return {
             "used": used_tokens,
             "available": max(0, available_tokens - buffer_tokens),
@@ -94,12 +102,9 @@ class Agent:
         usage = self.get_context_usage()
         if not usage:
             return
-
         used = usage["used"]
         total = usage["total"]
         pct = usage["percentage"]
-
-        # Color based on usage
         if pct < 50:
             color = "green"
             status_emoji = "✅"
@@ -112,17 +117,12 @@ class Agent:
         else:
             color = "red"
             status_emoji = "🚨"
-
-        # Visual bar (30 chars wide)
         bar_width = 30
         filled = int((pct / 100) * bar_width)
         empty = bar_width - filled
         bar = "█" * filled + "░" * empty
-
         def fmt(n: int) -> str:
             return f"{n/1000:.1f}K" if n >= 1000 else str(n)
-
-        # Use Rich Text for proper color handling
         text = Text()
         text.append(f"{status_emoji} Context: ", style="dim")
         text.append(bar, style=color)
@@ -134,8 +134,6 @@ class Agent:
         self.session_input_tokens += response.input_tokens
         self.session_output_tokens += response.output_tokens
         session_total = self.session_input_tokens + self.session_output_tokens
-
-        # Per-turn breakdown
         self.console.print(
             f"[dim]🪙 [bold cyan]In:[/bold cyan] {response.input_tokens:,} | "
             f"[bold magenta]Out:[/bold magenta] {response.output_tokens:,} | "
@@ -143,12 +141,59 @@ class Agent:
         )
         self.console.print(f"[dim]{action_text}[/dim]")
 
+    def _transition_phase(self, new_phase: AgentPhase):
+        """Transition to a new phase and notify the user."""
+        if self.phase == new_phase:
+            return
+        old_phase = self.phase
+        self.phase = new_phase
+        banner = format_phase_banner(new_phase)
+        self.console.print(f"[bold cyan]🔄 Phase transition: {old_phase.value.upper()} → {new_phase.value.upper()}[/bold cyan]")
+        self.console.print(f"[dim]{banner}[/dim]")
+
+        # On transition to VERIFYING, auto-inject verification instructions
+        if new_phase == AgentPhase.VERIFYING:
+            verify_msg = (
+                "All planned steps are complete. Please verify your changes by reading "
+                "the files you modified and running any relevant tests. "
+                "Use update_plan_status to mark verification as complete when satisfied."
+            )
+            self.memory.add_message(Message(role="user", content=verify_msg))
+            self.console.print("[dim]📝 Auto-injected verification instructions into context.[/dim]")
+
+    def _check_phase_transition(self):
+        """Check if we should auto-transition based on plan state."""
+        new_phase = PhaseTransition.check_transition(
+            self.phase, self.current_plan, self._pending_verification
+        )
+        if new_phase:
+            self._transition_phase(new_phase)
+
+    async def _auto_verify(self, file_path: str):
+        """Auto-verify a file by reading it back after write/diff."""
+        self.console.print(f"[dim]🔍 Auto-verifying {file_path}...[/dim]")
+        result = await self.registry.aexecute("read_file", {"file_path": file_path})
+        # Add verification result as a system note in memory
+        verify_note = f"[AUTO-VERIFY] File {file_path} after modification:
+{result[:500]}"
+        self.memory.add_message(Message(role="tool", content=verify_note, tool_call_id="auto-verify"))
+        # Remove from pending
+        if file_path in self._pending_verification:
+            self._pending_verification.remove(file_path)
+
     async def chat(self, user_input: str, max_iterations: int = 10) -> str | None:
         """
-        Takes user input, runs the async agent loop, and returns the final text response.
+        Takes user input, runs the async agent loop with phase enforcement,
+        and returns the final text response.
         """
         # -- ADD USER INPUT -----------------------------------------------------
         self.memory.add_message(Message(role="user", content=user_input))
+
+        # Reset phase for new task if we're in COMPLETED
+        if self.phase == AgentPhase.COMPLETED:
+            self._transition_phase(AgentPhase.IDLE)
+            self.current_plan = []
+            self._pending_verification = []
 
         iteration_count = 0
 
@@ -163,7 +208,7 @@ class Agent:
                     content="You have looped too many times. Please provide your final summary based on what you know."
                 ))
                 context = self._build_context()
-                final_response = await self.llm.acomplete(
+                final_response = await self.llm.async_complete(
                     context,
                     tools=None,
                     max_tokens=self.llm_config.get("max_tokens", 6000)
@@ -176,10 +221,12 @@ class Agent:
             context = self._build_context()
 
             # -- ASK LLM (ASYNC) ------------------------------------------------
+            # Only expose tools allowed in current phase
+            available_tools = self.registry.get_schemas_for_phase(self.phase)
             try:
-                response = await self.llm.acomplete(
+                response = await self.llm.async_complete(
                     context,
-                    tools=self.registry.schemas,
+                    tools=available_tools,
                     max_tokens=self.llm_config.get("max_tokens", 6000)
                 )
             except Exception as api_err:
@@ -208,6 +255,19 @@ class Agent:
                         args = json.loads(tool_call.arguments)
                     except (json.JSONDecodeError, TypeError) as parse_err:
                         result = f"Error: Could not parse arguments for '{tool_call.name}' — malformed JSON: {parse_err}"
+                        self.console.print(f"[bold red]{result}[/bold red]")
+                        self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                        continue
+
+                    # ==========================================
+                    # 0. PHASE ENFORCEMENT
+                    # ==========================================
+                    if not is_tool_allowed(self.phase, tool_call.name):
+                        allowed = get_allowed_tools(self.phase)
+                        result = (
+                            f"⛔ PHASE ERROR: Tool '{tool_call.name}' is not allowed in {self.phase.value} phase. "
+                            f"Allowed tools: {', '.join(allowed)}"
+                        )
                         self.console.print(f"[bold red]{result}[/bold red]")
                         self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
                         continue
@@ -242,6 +302,12 @@ class Agent:
                             self.console.print(f" [dim][ ][/dim] Step {i+1}: {step['title']}{files_hint}")
                         self.console.print("")
                         result = f"Plan created with {len(self.current_plan)} steps."
+                        # Auto-transition: IDLE → PLANNING
+                        self._transition_phase(AgentPhase.PLANNING)
+                        # Auto-mark first step as in_progress
+                        if self.current_plan:
+                            self.current_plan[0]["status"] = "in_progress"
+                            self._check_phase_transition()
 
                     # ==========================================
                     # 3. Human-in-the-Loop Questions
@@ -287,6 +353,8 @@ class Agent:
                                 step_title = self.current_plan[step_num - 1]["title"]
                                 self.console.print(f" {icon} Step {step_num}: {step_title}")
                                 result = f"Step {step_num} marked as {status}."
+                                # Check for phase transition after status update
+                                self._check_phase_transition()
                             else:
                                 result = f"Error: step_number {step_num} out of range."
 
@@ -300,6 +368,7 @@ class Agent:
                             fp = args.get("file_path")
                             if fp:
                                 self.touched_files.add(fp)
+                                self._pending_verification.append(fp)
 
                     # -- PRINT TOOL EXECUTION ------------------------------------
                     self.console.print(f"[bold cyan]🔧 Tool:[/bold cyan] [magenta]{tool_call.name}[/magenta]")
@@ -339,13 +408,18 @@ class Agent:
                             summary = result.replace("\n", " ")[:200]
                             self._discovered_context[f"tree:{dir_arg}"] = summary
 
+                # -- AUTO-VERIFICATION AFTER EACH TURN -------------------------
+                if self.phase == AgentPhase.EXECUTING and self._pending_verification:
+                    for fp in list(self._pending_verification):
+                        await self._auto_verify(fp)
+
                 self.console.print("[dim]⏳ Processing tool results...[/dim]")
 
     def _build_context(self) -> list[Message]:
         """
         Builds a fresh context list every turn.
-        Injects LTM, search context, working directory, and active plan
-        into a NEW system message without mutating the memory cache.
+        Injects LTM, search context, working directory, active plan,
+        and CURRENT PHASE into a NEW system message.
         """
         base_context = self.memory.get_context()
 
@@ -357,6 +431,15 @@ class Agent:
             history = base_context
 
         sections = [system_content]
+
+        # -- PHASE INDICATOR --
+        allowed_tools = get_allowed_tools(self.phase)
+        sections.append(
+            f"[CURRENT PHASE: {self.phase.value.upper()}]\n"
+            f"You are in the {self.phase.value} phase. "
+            f"Allowed tools: {', '.join(allowed_tools)}. "
+            f"Do NOT call tools outside this list."
+        )
 
         if self.ltm:
             past_context, ltm_token_count = self.ltm.get_recent_context(limit=5)
