@@ -538,7 +538,7 @@ async def async_main():
                 )
             )
 
-            summary_response = await llm.acomplete(
+            summary_response = await llm.async_complete(
                 context_for_summary,
                 tools=None,
                 max_tokens=config["llm"].get("max_tokens", 6000),

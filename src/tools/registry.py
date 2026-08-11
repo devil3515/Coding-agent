@@ -6,6 +6,7 @@ from typing import Callable, Any, Optional
 from pydantic import BaseModel, ValidationError
 
 from src.audit.logger import AuditLogger
+from src.core.state import AgentPhase, PHASE_TOOL_ALLOWLIST
 
 
 class ToolRegistry:
@@ -48,6 +49,15 @@ class ToolRegistry:
         })
         if pydantic_schema:
             self.pydantic_schemas[name] = pydantic_schema
+
+    def get_schemas_for_phase(self, phase: AgentPhase) -> list[dict]:
+        """
+        Return only the tool schemas allowed in the given phase.
+        This restricts what the LLM can even SEE in its tool list,
+        preventing it from calling disallowed tools at the API level.
+        """
+        allowed = PHASE_TOOL_ALLOWLIST.get(phase, [])
+        return [s for s in self.schemas if s["function"]["name"] in allowed]
 
     def execute(self, tool_name: str, arguments: dict) -> str:
         """Synchronous tool execution with validation and audit logging."""
