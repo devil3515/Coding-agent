@@ -16,6 +16,7 @@ from src.core.state import (
     format_phase_banner,
     get_allowed_tools,
 )
+from src.verification.engine import VerificationEngine
 
 
 class Agent:
@@ -66,6 +67,13 @@ class Agent:
 
         # --- SKILL STATE ---
         self.active_skill_name: str | None = None
+
+        # --- VERIFICATION ENGINE ---
+        self.verification = VerificationEngine(
+            registry=registry,
+            working_directory=working_directory or ".",
+            console=console,
+        )
 
     def _count_tokens(self, messages: list[Message]) -> int:
         """Local token counter using tiktoken if available."""
@@ -141,7 +149,7 @@ class Agent:
         )
         self.console.print(f"[dim]{action_text}[/dim]")
 
-    def _transition_phase(self, new_phase: AgentPhase):
+    async def _transition_phase(self, new_phase: AgentPhase):
         """Transition to a new phase and notify the user."""
         if self.phase == new_phase:
             return
@@ -153,31 +161,46 @@ class Agent:
 
         # On transition to VERIFYING, auto-inject verification instructions
         if new_phase == AgentPhase.VERIFYING:
+            self.console.print("[bold cyan]🔬 Phase 2 Self-Verification: Running full test suite...[/bold cyan]")
+            reports = await self.verification.run_full_verification()
+            for report in reports:
+                self.memory.add_message(Message(
+                    role="tool",
+                    content=self.verification.format_report_for_llm(report),
+                    tool_call_id="full-verify",
+                ))
+
             verify_msg = (
-                "All planned steps are complete. Please verify your changes by reading "
-                "the files you modified and running any relevant tests. "
-                "Use update_plan_status to mark verification as complete when satisfied."
+                "All planned steps are complete. Full verification results are above. "
+                "Please review any failures, fix issues if needed, and use update_plan_status "
+                "to mark verification as complete when satisfied."
             )
             self.memory.add_message(Message(role="user", content=verify_msg))
-            self.console.print("[dim]📝 Auto-injected verification instructions into context.[/dim]")
+            self.console.print("[dim]📝 Auto-injected full verification results into context.[/dim]")
 
-    def _check_phase_transition(self):
+    async def _check_phase_transition(self):
         """Check if we should auto-transition based on plan state."""
         new_phase = PhaseTransition.check_transition(
             self.phase, self.current_plan, self._pending_verification
         )
         if new_phase:
-            self._transition_phase(new_phase)
+            await self._transition_phase(new_phase)
 
     async def _auto_verify(self, file_path: str):
         """Auto-verify a file by reading it back after write/diff."""
-        self.console.print(f"[dim]🔍 Auto-verifying {file_path}...[/dim]")
-        result = await self.registry.aexecute("read_file", {"file_path": file_path})
-        # Add verification result as a system note in memory
-        verify_note = f"[AUTO-VERIFY] File {file_path} after modification:
-{result[:500]}"
-        self.memory.add_message(Message(role="tool", content=verify_note, tool_call_id="auto-verify"))
-        # Remove from pending
+        report = await self.verification.verify_file(file_path)
+
+        self.memory.add_message(Message(
+            role="tool",
+            content=self.verification.format_report_for_llm(report),
+            tool_call_id=f"auto-verify-{file_path}",
+        ))
+
+        if not report.overall_pass:
+            self.console.print(f"[bold red]❌ Verification failed for {file_path}. Details injected into context.[/bold red]")
+        else:
+            self.console.print(f"[bold green]✅ Verification passed for {file_path}[/bold green]")
+
         if file_path in self._pending_verification:
             self._pending_verification.remove(file_path)
 
@@ -191,7 +214,7 @@ class Agent:
 
         # Reset phase for new task if we're in COMPLETED
         if self.phase == AgentPhase.COMPLETED:
-            self._transition_phase(AgentPhase.IDLE)
+            await self._transition_phase(AgentPhase.IDLE)
             self.current_plan = []
             self._pending_verification = []
 
@@ -234,7 +257,6 @@ class Agent:
                 self.memory.add_message(Message(role="assistant", content=f"[API error: {api_err}]"))
                 return f"The LLM API returned an error: {api_err}"
 
-            # -- CHECK IF LLM IS DONE -------------------------------------------
             if response.is_final:
                 self._print_token_usage(response, "✅ Final response generated.")
                 self.memory.add_message(Message(role="assistant", content=response.content))
@@ -303,11 +325,11 @@ class Agent:
                         self.console.print("")
                         result = f"Plan created with {len(self.current_plan)} steps."
                         # Auto-transition: IDLE → PLANNING
-                        self._transition_phase(AgentPhase.PLANNING)
+                        await self._transition_phase(AgentPhase.PLANNING)
                         # Auto-mark first step as in_progress
                         if self.current_plan:
                             self.current_plan[0]["status"] = "in_progress"
-                            self._check_phase_transition()
+                            await self._check_phase_transition()
 
                     # ==========================================
                     # 3. Human-in-the-Loop Questions
@@ -354,7 +376,7 @@ class Agent:
                                 self.console.print(f" {icon} Step {step_num}: {step_title}")
                                 result = f"Step {step_num} marked as {status}."
                                 # Check for phase transition after status update
-                                self._check_phase_transition()
+                                await self._check_phase_transition()
                             else:
                                 result = f"Error: step_number {step_num} out of range."
 
@@ -463,7 +485,7 @@ class Agent:
 
         if self.current_plan:
             active_idx = next(
-                (i for i, s in enumerate(self.current_plan) if s["status"] == "in_progress"),
+                (i for i, s in enumerate(self.current_plan) if s.get("status") == "in_progress"),
                 None
             )
             plan_lines = []

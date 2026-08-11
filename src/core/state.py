@@ -112,6 +112,11 @@ class PhaseTransition:
             if all(s.get("status") in ("completed", "failed") for s in plan):
                 return AgentPhase.VERIFYING
 
+        # VERIFYING → RETRYING: any step failed and needs rework (Phase 2)
+        if current_phase == AgentPhase.VERIFYING:
+            if any(s.get("status") == "failed" for s in plan):
+                return AgentPhase.RETRYING
+
         # VERIFYING → COMPLETED: verification passed (no pending files)
         if current_phase == AgentPhase.VERIFYING:
             if not pending_verification:

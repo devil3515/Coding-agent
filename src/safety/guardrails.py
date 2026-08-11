@@ -63,7 +63,7 @@ def is_shell_safe(command: str, working_directory: str) -> tuple[bool, str]:
                 f"⛔ SECURITY ERROR: Dangerous shell command blocked: {command}",
             )
 
-    if "../" in command or "..\" in command:
+    if "../" in command or "..\\" in command:
         if not any(cmd in command for cmd in ["git ", "python ", "node ", "npm ", "uv "]):
             return (
                 False,
