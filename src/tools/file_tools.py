@@ -4,7 +4,7 @@ import fnmatch
 
 MAX_LINES_PER_READ = 500
 
-_SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs"}
+_SKIP_DIRS = {".venv", "venv", "node_modules", "__pycache__", ".git", ".mypy_cache", ".pytest_cache", "dist", "build", ".eggs", ".agent-audit"}
 
 
 def find_files(pattern: str, directory: str = ".", max_results: int = 50) -> str:

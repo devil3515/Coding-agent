@@ -25,8 +25,9 @@ from src.memory.project_memory import ProjectMemoryManager
 from src.models import ShortTermMemoryModel, LongTermMemoryModel, ProjectMemoryContent, ProjectMemoryModel
 from src.llm.base import Message
 from src.tools.codebase_graph import search_codebase, get_codebase_overview
-from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree
+from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree, find_files
 from src.tools.planning import create_project_plan, update_project_plan, ask_user_question, update_plan_text
+from src.tools.scratchpad import update_scratchpad, read_scratchpad
 from prompts.registry import get_default_prompt
 from src.mcp.bridge import MCPBridge
 from src.audit.logger import AuditLogger
@@ -80,6 +81,7 @@ def create_agent_session(
         llm_config=llm_config,
         working_directory=working_directory,
         session_id=session_id,
+        harness=config.get("harness", {}),
     )
 
 
@@ -309,6 +311,78 @@ async def async_main():
             directory if (directory and directory != ".") else working_directory, max_depth
         ),
         pydantic_schema=schemas.GetFileTreeArgs,
+    )
+
+    # -- FIND FILES TOOL (GLOB) ------------------------------------------------
+    registry.register(
+        name="find_files",
+        description=(
+            "Searches for files matching a glob pattern within a directory. "
+            "Use this to locate files by name or pattern (e.g. '*.py', 'test_*.py', "
+            "'**/*.yaml') instead of guessing paths. Prefer this over read_file when "
+            "you don't know the exact file name."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match file names. Examples: '*.py', 'test_*.py', '**/*.yaml', 'config.{json,yaml}'.",
+                },
+                "directory": {"type": "string", "description": "Starting directory (default '.')."},
+                "max_results": {"type": "integer", "description": "Max files to return (default 50, max 500)."},
+            },
+            "required": ["pattern"],
+        },
+        function=lambda pattern, directory=".", max_results=50: find_files(
+            pattern,
+            directory if (directory and directory != ".") else working_directory,
+            max_results,
+        ),
+        pydantic_schema=schemas.FindFilesArgs,
+    )
+
+    # -- SCRATCHPAD TOOLS ------------------------------------------------------
+    scratchpad_max_chars = config.get("harness", {}).get("scratchpad_max_chars", 20000)
+
+    registry.register(
+        name="update_scratchpad",
+        description=(
+            "Writes markdown to your private working-memory file at "
+            ".agent-audit/scratchpad.md. Use this to record: (1) your current "
+            "hypothesis, (2) files you have already read and ruled out, and "
+            "(3) what you plan to read next. The harness auto-injects the latest "
+            "scratchpad into your context every turn, so you do not need to "
+            "re-read it yourself."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Markdown content to write. Overwrites the previous scratchpad.",
+                },
+            },
+            "required": ["content"],
+        },
+        function=lambda content: update_scratchpad(
+            content=content,
+            working_directory=working_directory,
+            max_chars=scratchpad_max_chars,
+        ),
+        pydantic_schema=schemas.UpdateScratchpadArgs,
+    )
+
+    registry.register(
+        name="read_scratchpad",
+        description=(
+            "Returns the current scratchpad contents. Returns a 'no scratchpad yet' "
+            "message if the file does not exist. Use this to review your working "
+            "memory before committing to a new line of investigation."
+        ),
+        parameters={"type": "object", "properties": {}},
+        function=lambda: read_scratchpad(working_directory=working_directory),
+        pydantic_schema=schemas.ReadScratchpadArgs,
     )
 
     # -- MCP TOOLS ------------------------------------------------------------

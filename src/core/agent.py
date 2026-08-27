@@ -1,5 +1,6 @@
 """Async core reasoning loop of the coding agent with phase-based state machine."""
 import json
+import re
 import asyncio
 from rich.console import Console
 from rich.text import Text
@@ -17,6 +18,26 @@ from src.core.state import (
     get_allowed_tools,
 )
 from src.verification.engine import VerificationEngine
+from src.tools.scratchpad import get_scratchpad_summary
+
+# Tools whose execution counts as a "read" for the read-budget gate.
+# Writes, plan tools, user questions, and version-control commands do not.
+READ_ONLY_TOOLS = frozenset({
+    "read_file",
+    "search_codebase",
+    "get_codebase_overview",
+    "get_file_tree",
+    "find_files",
+    "read_scratchpad",
+})
+
+# Shell commands that contain output redirection or pipes to write files
+# are treated as writes for the purposes of the read budget. We still rely
+# on is_shell_safe to actually block destructive commands.
+_SHELL_REDIRECT_TOKENS = (">", ">>", "| tee", ">&", "2>")
+
+# Matches "(File: <path>, Line: <n>)" lines emitted by search_codebase.
+_SEARCH_FILE_RE = re.compile(r"\(File:\s*([^,)]+),")
 
 
 class Agent:
@@ -35,6 +56,7 @@ class Agent:
         llm_config: dict = None,
         working_directory: str = None,
         session_id: str = None,
+        harness: dict = None,
     ):
         self.llm = llm
         self.registry = registry
@@ -44,6 +66,16 @@ class Agent:
         self.llm_config = llm_config or {}
         self.working_directory = working_directory
         self.session_id = session_id
+
+        # --- HARNESS CONFIG ---
+        # Working-memory + read-budget pacing. Fall back to the same defaults
+        # as src/config/settings.py if the section is absent.
+        defaults = {
+            "read_budget": 5,
+            "scratchpad_inject_tokens": 800,
+            "scratchpad_max_chars": 20000,
+        }
+        self.harness = {**defaults, **(harness or {})}
 
         # --- TOKEN TRACKING STATE ---
         self.session_input_tokens = 0
@@ -68,12 +100,85 @@ class Agent:
         # --- SKILL STATE ---
         self.active_skill_name: str | None = None
 
+        # --- READ-BUDGET TRACKER (reset at the start of every chat() call) ---
+        self._read_only_calls_this_turn: int = 0
+        self._files_read_this_turn: list[str] = []
+        self._scratchpad_updated_this_turn: bool = False
+        self._nudge_injected_this_turn: bool = False
+
         # --- VERIFICATION ENGINE ---
         self.verification = VerificationEngine(
             registry=registry,
             working_directory=working_directory or ".",
             console=console,
         )
+
+    # ------------------------------------------------------------------ #
+    # Read-budget classification
+    # ------------------------------------------------------------------ #
+    def _is_shell_read_only(self, command: str) -> bool:
+        """Heuristic: a shell command counts as a read unless it redirects output."""
+        if not command:
+            return False
+        return not any(tok in command for tok in _SHELL_REDIRECT_TOKENS)
+
+    def _classify_tool_call(self, tool_name: str, args: dict) -> str:
+        """Return 'read', 'write', or 'neutral' for the given tool call."""
+        if tool_name == "update_scratchpad":
+            return "scratchpad"
+        if tool_name in ("write_file", "apply_diff"):
+            return "write"
+        if tool_name in (
+            "create_project_plan",
+            "update_plan_status",
+            "update_plan_text",
+            "ask_user_question",
+            "run_git",
+        ):
+            return "neutral"
+        if tool_name in READ_ONLY_TOOLS:
+            return "read"
+        if tool_name == "run_shell_command":
+            cmd = (args or {}).get("command", "")
+            return "read" if self._is_shell_read_only(cmd) else "neutral"
+        return "neutral"
+
+    def _reset_turn_trackers(self):
+        """Reset per-turn counters. Called at the start of every chat() invocation."""
+        self._read_only_calls_this_turn = 0
+        self._files_read_this_turn = []
+        self._scratchpad_updated_this_turn = False
+        self._nudge_injected_this_turn = False
+
+    def _maybe_inject_nudge(self):
+        """Inject a one-time nudge asking the LLM to update the scratchpad.
+
+        Fires at most once per turn, only when the read budget is exhausted
+        and the LLM has not yet called update_scratchpad.
+        """
+        if self._nudge_injected_this_turn:
+            return
+        if self._scratchpad_updated_this_turn:
+            return
+        budget = int(self.harness.get("read_budget", 5) or 5)
+        if self._read_only_calls_this_turn < budget:
+            return
+
+        nudge = (
+            f"[Harness Nudge] You have made {self._read_only_calls_this_turn} "
+            f"read-only tool calls this turn without updating your scratchpad. "
+            f"Before reading more, call update_scratchpad to record: "
+            f"(1) your current hypothesis, "
+            f"(2) any files you have already eliminated, and "
+            f"(3) what you plan to read next and why."
+        )
+        self.memory.add_message(Message(role="user", content=nudge))
+        self.console.print(
+            f"[bold yellow]🟡 Harness nudge: {self._read_only_calls_this_turn} "
+            f"reads without a scratchpad update — asking the agent to commit "
+            f"to a hypothesis.[/bold yellow]"
+        )
+        self._nudge_injected_this_turn = True
 
     def _count_tokens(self, messages: list[Message]) -> int:
         """Local token counter using tiktoken if available."""
@@ -165,9 +270,8 @@ class Agent:
             reports = await self.verification.run_full_verification()
             for report in reports:
                 self.memory.add_message(Message(
-                    role="tool",
-                    content=self.verification.format_report_for_llm(report),
-                    tool_call_id="full-verify",
+                    role="user",
+                    content=f"[Full Verification Report]:\n{self.verification.format_report_for_llm(report)}"
                 ))
 
             verify_msg = (
@@ -191,9 +295,8 @@ class Agent:
         report = await self.verification.verify_file(file_path)
 
         self.memory.add_message(Message(
-            role="tool",
-            content=self.verification.format_report_for_llm(report),
-            tool_call_id=f"auto-verify-{file_path}",
+            role="user",
+            content=f"[Auto-Verification Report for {file_path}]:\n{self.verification.format_report_for_llm(report)}"
         ))
 
         if not report.overall_pass:
@@ -209,6 +312,9 @@ class Agent:
         Takes user input, runs the async agent loop with phase enforcement,
         and returns the final text response.
         """
+        # -- RESET PER-TURN DEBUG-HARNESS TRACKERS -----------------------------
+        self._reset_turn_trackers()
+
         # -- ADD USER INPUT -----------------------------------------------------
         self.memory.add_message(Message(role="user", content=user_input))
 
@@ -253,6 +359,28 @@ class Agent:
                     max_tokens=self.llm_config.get("max_tokens", 6000)
                 )
             except Exception as api_err:
+                err_str = str(api_err)
+                # Some providers (notably GMICloud / 400) reject a turn when the
+                # model's tool_call.id doesn't match a tool the provider knows
+                # about. This is recoverable: drop the broken turn, re-prompt
+                # with a hint to use a clean final answer, and continue.
+                if "tool id" in err_str.lower() and "not found" in err_str.lower():
+                    self.console.print(
+                        f"[bold yellow]⚠️ Provider rejected a stale tool id "
+                        f"(iteration {iteration_count}). Re-prompting with a "
+                        f"clean final-answer request.[/bold yellow]"
+                    )
+                    self.memory.add_message(Message(
+                        role="user",
+                        content=(
+                            "Your previous tool call was rejected by the provider "
+                            "(stale tool id). Please respond with a final text "
+                            "answer based on what you already know, or call a "
+                            "single new tool with a fresh id."
+                        ),
+                    ))
+                    # Force the loop to rebuild context and call the LLM again.
+                    continue
                 self.console.print(f"[bold red]⚠️ LLM API error (iteration {iteration_count}): {api_err}[/bold red]")
                 self.memory.add_message(Message(role="assistant", content=f"[API error: {api_err}]"))
                 return f"The LLM API returned an error: {api_err}"
@@ -280,6 +408,23 @@ class Agent:
                         self.console.print(f"[bold red]{result}[/bold red]")
                         self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
                         continue
+
+                    # ==========================================
+                    # 0a. HARNESS TRACKING (pre-execution)
+                    # ==========================================
+                    # Update the per-turn read budget, file list, and scratchpad
+                    # flag based on the call we are about to make. We do this
+                    # before the phase check so blocked calls don't pollute the
+                    # counters — but we do it after parsing args.
+                    classification = self._classify_tool_call(tool_call.name, args)
+                    if classification == "read":
+                        self._read_only_calls_this_turn += 1
+                        if tool_call.name == "read_file":
+                            fp = args.get("file_path")
+                            if fp and fp not in self._files_read_this_turn:
+                                self._files_read_this_turn.append(fp)
+                    elif classification == "scratchpad":
+                        self._scratchpad_updated_this_turn = True
 
                     # ==========================================
                     # 0. PHASE ENFORCEMENT
@@ -414,9 +559,12 @@ class Agent:
                         if query and result and "No functions" not in result:
                             summary = result.replace("\n", " ")[:200]
                             self._discovered_context[query.lower()] = summary
-                            for word in query.lower().split():
-                                if len(word) > 3:
-                                    self._discovered_context[f"kw:{word}"] = summary
+                            # Capture file paths the search touched so we can
+                            # tell the LLM "you've already searched these".
+                            for match in _SEARCH_FILE_RE.finditer(result):
+                                fp = match.group(1).strip()
+                                if fp and fp not in self._files_read_this_turn:
+                                    self._files_read_this_turn.append(fp)
 
                     elif tool_call.name == "get_codebase_overview":
                         dir_arg = args.get("directory", self.working_directory or ".")
@@ -429,6 +577,9 @@ class Agent:
                         if result and "not found" not in result.lower():
                             summary = result.replace("\n", " ")[:200]
                             self._discovered_context[f"tree:{dir_arg}"] = summary
+
+                # -- HARNESS NUDGE (after every iteration, at most once) -------
+                self._maybe_inject_nudge()
 
                 # -- AUTO-VERIFICATION AFTER EACH TURN -------------------------
                 if self.phase == AgentPhase.EXECUTING and self._pending_verification:
@@ -469,12 +620,66 @@ class Agent:
                 sections.append(past_context)
 
         if self._discovered_context:
-            search_lines = ["\n" + "="*60 + "\n🔍 PREVIOUSLY DISCOVERED CONTEXT (CRITICAL - DO NOT RE-SEARCH)\n" + "="*60]
-            for query, summary in list(self._discovered_context.items())[:10]:
-                if not query.startswith("kw:"):
+            # Drop the kw: copies we keep for internal indexing. They are
+            # silent — we only show the original query → summary mapping.
+            # Cap at 25 to keep the prompt bounded.
+            visible_items = [
+                (k, v) for k, v in self._discovered_context.items()
+                if not k.startswith("kw:")
+            ][:25]
+
+            if visible_items:
+                search_lines = [
+                    "\n" + "=" * 60,
+                    "🔍 PREVIOUSLY DISCOVERED CONTEXT",
+                    "[CRITICAL — DO NOT RE-SEARCH THESE. The harness has injected "
+                    "the results into your context. Reading or searching them again "
+                    "wastes iterations.]",
+                    "=" * 60,
+                ]
+                for query, summary in visible_items:
                     search_lines.append(f"• '{query}': {summary}")
-            search_lines.append("\n⚠️ IMPORTANT: These searches have already been done. USE this context instead of re-searching.")
-            sections.append("\n".join(search_lines))
+                sections.append("\n".join(search_lines))
+
+        if self._files_read_this_turn:
+            files_list = ", ".join(self._files_read_this_turn)
+            sections.append(
+                f"[FILES ALREADY READ THIS TURN]: {files_list}\n"
+                f"[You do not need to read them again — the contents are in your "
+                f"context above or in the scratchpad below.]"
+            )
+
+        # Scratchpad auto-injection. Read the file fresh every turn because
+        # the LLM may have updated it since _build_context was last called.
+        try:
+            scratchpad_max_chars = int(self.harness.get("scratchpad_inject_tokens", 800) or 800) * 4
+        except (TypeError, ValueError):
+            scratchpad_max_chars = 3200
+        scratchpad = get_scratchpad_summary(
+            self.working_directory or ".",
+            max_chars=scratchpad_max_chars,
+        )
+        if scratchpad.get("exists") and scratchpad.get("content", "").strip():
+            header_parts = ["=" * 60, "📝 SCRATCHPAD"]
+            if scratchpad.get("modified_at"):
+                header_parts.append(
+                    f"last updated {scratchpad['modified_at']}, "
+                    f"{scratchpad.get('line_count', 0)} lines "
+                    f"(~{scratchpad.get('char_count', 0) // 4} tokens)"
+                )
+            header_parts.append("=" * 60)
+            body = scratchpad["content"]
+            if scratchpad.get("truncated"):
+                body += "\n[truncated to fit, call read_scratchpad for full]"
+            else:
+                body += "\n[End of scratchpad. Call read_scratchpad to see the full content.]"
+            sections.append("\n".join(header_parts) + "\n" + body)
+        else:
+            sections.append(
+                "=" * 60 + "\n📝 SCRATCHPAD — empty.\n"
+                "[No scratchpad yet. Call update_scratchpad to start one. It is "
+                "your working memory across turns.]\n" + "=" * 60
+            )
 
         if self.working_directory:
             sections.append(

@@ -81,3 +81,31 @@ class AskUserQuestionArgs(BaseModel):
     question: str = Field(..., description="The question to ask")
     question_type: str = Field("text", description="Free text or multiple choice")
     options: Optional[List[str]] = Field(None, description="Choices for MCQ questions")
+
+
+class UpdateScratchpadArgs(BaseModel):
+    content: str = Field(
+        ...,
+        description=(
+            "Markdown content to write to the scratchpad. Overwrites any previous "
+            "content. Suggested sections: (1) current hypothesis, (2) files you've "
+            "ruled out and why, (3) what you plan to read next."
+        ),
+    )
+
+
+class ReadScratchpadArgs(BaseModel):
+    pass
+
+
+class FindFilesArgs(BaseModel):
+    pattern: str = Field(
+        ...,
+        description=(
+            "Glob pattern to match file names. Examples: '*.py', 'test_*.py', "
+            "'**/*.yaml', 'config.{json,yaml,xml}'."
+        ),
+        min_length=1,
+    )
+    directory: str = Field(".", description="Starting directory for the search.")
+    max_results: int = Field(50, ge=1, le=500, description="Maximum number of files to return.")

@@ -1,5 +1,6 @@
 """Test execution for modified files."""
 import asyncio
+import sys
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional
@@ -59,6 +60,8 @@ class TestRunner:
         for test_dir in test_dirs:
             if not test_dir.exists():
                 continue
+            # ponytail: O(N) scan of all test files per lookup, reading each one.
+            # Fine for small/medium projects. Upgrade: build a name->test index once.
             for test_file in test_dir.rglob("*.py"):
                 if test_file.name.startswith("test_") or test_file.name.endswith("_test.py"):
                     try:
@@ -83,7 +86,7 @@ class TestRunner:
         If test_files is given, run those specifically.
         Otherwise run full discovery.
         """
-        cmd = ["python", "-m", "pytest", "-v", "--tb=short", "--color=no"]
+        cmd = [sys.executable, "-m", "pytest", "-v", "--tb=short", "--color=no"]
         files_tested: List[str] = []
 
         if test_files:
