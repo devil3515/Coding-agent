@@ -2,6 +2,14 @@ from abc import ABC, abstractmethod
 from typing import Generator, Any, AsyncGenerator
 from dataclasses import dataclass, field
 
+class LLMResponseError(Exception):
+    """Raised when an LLM provider returns a structurally valid HTTP response
+    that cannot be parsed into an LLMResponse — e.g. choices is None, the
+    message is missing, usage is missing, etc. Providers should raise it; the
+    agent loop catches it (same as it catches network exceptions) and turns it
+    into a recoverable `llm_error` audit event so the model can decide whether
+    to retry, switch tactics, or surface the error."""
+
 @dataclass
 class ToolCall:
     id: str
@@ -42,6 +50,9 @@ class LLMResponse:
 class LLMProvider(ABC):
     """Base class for all LLMs."""
 
+    def __init__(self, audit_callback=None):
+        self.audit_callback = audit_callback
+
     @abstractmethod
     def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> str:
         """Chat with the LLM."""
@@ -53,11 +64,11 @@ class LLMProvider(ABC):
         ...
 
     @abstractmethod
-    def async_complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> LLMResponse:
+    async def async_complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> LLMResponse:
         """Async version of complete """
         ...
 
     @abstractmethod
-    def async_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncGenerator[str, None]:
+    async def async_stream(self, messages: list[dict[str, Any]], **kwargs: Any) -> AsyncGenerator[str, None]:
         """Asynchronous stream from the LLM."""
         ...

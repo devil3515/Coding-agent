@@ -2,6 +2,7 @@
 import json
 import re
 import asyncio
+from datetime import datetime, timezone
 from rich.console import Console
 from rich.text import Text
 from src.llm.base import Message
@@ -19,6 +20,7 @@ from src.core.state import (
 )
 from src.verification.engine import VerificationEngine
 from src.tools.scratchpad import get_scratchpad_summary
+from src.audit.logger import AuditEvent
 
 # Tools whose execution counts as a "read" for the read-budget gate.
 # Writes, plan tools, user questions, and version-control commands do not.
@@ -57,6 +59,7 @@ class Agent:
         working_directory: str = None,
         session_id: str = None,
         harness: dict = None,
+        audit_logger=None,  # NEW
     ):
         self.llm = llm
         self.registry = registry
@@ -76,6 +79,7 @@ class Agent:
             "scratchpad_max_chars": 20000,
         }
         self.harness = {**defaults, **(harness or {})}
+        self.audit_logger = audit_logger
 
         # --- TOKEN TRACKING STATE ---
         self.session_input_tokens = 0
@@ -149,6 +153,19 @@ class Agent:
         self._files_read_this_turn = []
         self._scratchpad_updated_this_turn = False
         self._nudge_injected_this_turn = False
+        # Agentic retry budget for malformed LLM responses: one fresh retry
+        # per chat() turn so a consistently broken provider can't pin the
+        # agent in an infinite loop.
+        self._llm_error_retries = 0
+
+    def _emit(self, event: AuditEvent) -> None:
+        if self.audit_logger is None:
+            return
+        try:
+            self.audit_logger.event(event)
+        except Exception:
+            # Audit must never break the loop; quiet by design.
+            pass
 
     def _maybe_inject_nudge(self):
         """Inject a one-time nudge asking the LLM to update the scratchpad.
@@ -173,6 +190,13 @@ class Agent:
             f"(3) what you plan to read next and why."
         )
         self.memory.add_message(Message(role="user", content=nudge))
+        self._emit(AuditEvent(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id=self.session_id,
+            event_type="harness_nudge",
+            working_directory=self.working_directory,
+            metadata={"reads_this_turn": self._read_only_calls_this_turn, "budget": budget},
+        ))
         self.console.print(
             f"[bold yellow]🟡 Harness nudge: {self._read_only_calls_this_turn} "
             f"reads without a scratchpad update — asking the agent to commit "
@@ -262,6 +286,14 @@ class Agent:
         self.phase = new_phase
         banner = format_phase_banner(new_phase)
         self.console.print(f"[bold cyan]🔄 Phase transition: {old_phase.value.upper()} → {new_phase.value.upper()}[/bold cyan]")
+        self._emit(AuditEvent(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id=self.session_id,
+            event_type="phase_transition",
+            phase=new_phase.value,
+            working_directory=self.working_directory,
+            metadata={"from": old_phase.value, "to": new_phase.value},
+        ))
         self.console.print(f"[dim]{banner}[/dim]")
 
         # On transition to VERIFYING, auto-inject verification instructions
@@ -272,6 +304,17 @@ class Agent:
                 self.memory.add_message(Message(
                     role="user",
                     content=f"[Full Verification Report]:\n{self.verification.format_report_for_llm(report)}"
+                ))
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="verification_report",
+                    phase=new_phase.value,
+                    working_directory=self.working_directory,
+                    result_status="success" if report.overall_pass else "error",
+                    result_summary="passed" if report.overall_pass else "failed",
+                    result_content=self.verification.format_report_for_llm(report),
+                    metadata={"scope": "full"},
                 ))
 
             verify_msg = (
@@ -298,6 +341,16 @@ class Agent:
             role="user",
             content=f"[Auto-Verification Report for {file_path}]:\n{self.verification.format_report_for_llm(report)}"
         ))
+        self._emit(AuditEvent(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id=self.session_id,
+            event_type="verification_report",
+            working_directory=self.working_directory,
+            result_status="success" if report.overall_pass else "error",
+            result_summary="passed" if report.overall_pass else "failed",
+            result_content=self.verification.format_report_for_llm(report),
+            metadata={"file": file_path},
+        ))
 
         if not report.overall_pass:
             self.console.print(f"[bold red]❌ Verification failed for {file_path}. Details injected into context.[/bold red]")
@@ -315,8 +368,25 @@ class Agent:
         # -- RESET PER-TURN DEBUG-HARNESS TRACKERS -----------------------------
         self._reset_turn_trackers()
 
+        # -- SESSION_START (first turn of a chat() call only) --
+        self._emit(AuditEvent(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id=self.session_id,
+            event_type="session_start",
+            working_directory=self.working_directory,
+            metadata={"input_preview": user_input[:200]},
+        ))
+
         # -- ADD USER INPUT -----------------------------------------------------
         self.memory.add_message(Message(role="user", content=user_input))
+        self._emit(AuditEvent(
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            session_id=self.session_id,
+            event_type="user_input",
+            working_directory=self.working_directory,
+            result_content=user_input,
+            result_summary=user_input[:500],
+        ))
 
         # Reset phase for new task if we're in COMPLETED
         if self.phase == AgentPhase.COMPLETED:
@@ -328,10 +398,23 @@ class Agent:
 
         while True:
             iteration_count += 1
+            # Update the registry's per-call context so emitted events are
+            # correlated with this iteration.
+            self.registry.current_iteration = iteration_count
+            self.registry.current_phase = self.phase.value
 
             # -- KILL SWITCH ----------------------------------------------------
             if iteration_count >= max_iterations:
                 self.console.print("[bold red]⚠️ Max iterations reached. Forcing final response.[/bold red]")
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="kill_switch",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    metadata={"max_iterations": max_iterations},
+                ))
                 self.memory.add_message(Message(
                     role="user",
                     content="You have looped too many times. Please provide your final summary based on what you know."
@@ -344,6 +427,28 @@ class Agent:
                 )
                 self._print_token_usage(final_response, "🛑 Forced final response.")
                 self.memory.add_message(Message(role="assistant", content=final_response.content))
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="assistant_message",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    result_content=final_response.content,
+                    result_summary=(final_response.content or "")[:500],
+                    model=getattr(self.llm, "model", None),
+                    input_tokens=final_response.input_tokens,
+                    output_tokens=final_response.output_tokens,
+                ))
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="session_end",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    metadata={"exit_reason": "kill_switch"},
+                ))
                 return final_response.content
 
             # -- BUILD FRESH CONTEXT --------------------------------------------
@@ -359,6 +464,17 @@ class Agent:
                     max_tokens=self.llm_config.get("max_tokens", 6000)
                 )
             except Exception as api_err:
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="llm_error",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    model=getattr(self.llm, "model", None),
+                    result_summary=str(api_err)[:500],
+                    result_content=str(api_err),
+                ))
                 err_str = str(api_err)
                 # Some providers (notably GMICloud / 400) reject a turn when the
                 # model's tool_call.id doesn't match a tool the provider knows
@@ -381,6 +497,37 @@ class Agent:
                     ))
                     # Force the loop to rebuild context and call the LLM again.
                     continue
+                # Malformed LLM response (e.g. OpenRouter free-tier returns
+                # HTTP 200 but `choices` is None, or `usage` is missing). This
+                # is transient infrastructure flakiness, not a model mistake —
+                # surface the exact field that was None so the model can
+                # either retry the same request or pivot to a different
+                # strategy. Cap to one retry per turn to avoid an infinite
+                # loop when a provider is consistently broken; if the
+                # retry also fails we fall through to the generic return
+                # below.
+                if "malformed" in err_str.lower() and getattr(self, "_llm_error_retries", 0) < 1:
+                    self._llm_error_retries = getattr(self, "_llm_error_retries", 0) + 1
+                    self.console.print(
+                        f"[bold yellow]⚠️ Malformed LLM response "
+                        f"(iteration {iteration_count}): {err_str}. "
+                        f"Sleeping 1.5s before re-prompting.[/bold yellow]"
+                    )
+                    # OpenRouter free-tier 200-with-bad-body is often a
+                    # sub-second provider hiccup; a tiny backoff makes the
+                    # retry land on a healthy request slot more often than not.
+                    await asyncio.sleep(1.5)
+                    self.memory.add_message(Message(
+                        role="user",
+                        content=(
+                            f"The LLM provider returned a malformed response "
+                            f"on your previous turn: {err_str}. "
+                            f"Please try again — either repeat your last "
+                            f"action with a slightly different phrasing, or "
+                            f"pivot to a different tool / approach."
+                        ),
+                    ))
+                    continue
                 self.console.print(f"[bold red]⚠️ LLM API error (iteration {iteration_count}): {api_err}[/bold red]")
                 self.memory.add_message(Message(role="assistant", content=f"[API error: {api_err}]"))
                 return f"The LLM API returned an error: {api_err}"
@@ -388,13 +535,59 @@ class Agent:
             if response.is_final:
                 self._print_token_usage(response, "✅ Final response generated.")
                 self.memory.add_message(Message(role="assistant", content=response.content))
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="assistant_message",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    result_content=response.content,
+                    result_summary=(response.content or "")[:500],
+                    model=getattr(self.llm, "model", None),
+                    input_tokens=response.input_tokens,
+                    output_tokens=response.output_tokens,
+                ))
+                self._emit(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=self.session_id,
+                    event_type="session_end",
+                    iteration=iteration_count,
+                    phase=self.phase.value,
+                    working_directory=self.working_directory,
+                    metadata={"exit_reason": "is_final"},
+                ))
                 return response.content
 
             else:
                 if not response.tool_calls:
                     self._print_token_usage(response, "⚠️ Response cut off (hit max_tokens limit).")
-                    self.memory.add_message(Message(role="assistant", content=response.content or "[Response truncated]"))
-                    return response.content or "[Response truncated due to length limit]"
+                    content = response.content or "[Response truncated]"
+                    self.memory.add_message(Message(role="assistant", content=content))
+                    self._emit(AuditEvent(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        session_id=self.session_id,
+                        event_type="assistant_message",
+                        iteration=iteration_count,
+                        phase=self.phase.value,
+                        working_directory=self.working_directory,
+                        result_content=content,
+                        result_summary=content[:500],
+                        model=getattr(self.llm, "model", None),
+                        input_tokens=response.input_tokens,
+                        output_tokens=response.output_tokens,
+                        metadata={"exit_reason": "cut_off"},
+                    ))
+                    self._emit(AuditEvent(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        session_id=self.session_id,
+                        event_type="session_end",
+                        iteration=iteration_count,
+                        phase=self.phase.value,
+                        working_directory=self.working_directory,
+                        metadata={"exit_reason": "cut_off"},
+                    ))
+                    return content
 
                 self._print_token_usage(response, f"🧠 Requested {len(response.tool_calls)} tool(s).")
 
@@ -437,6 +630,20 @@ class Agent:
                         )
                         self.console.print(f"[bold red]{result}[/bold red]")
                         self.memory.add_message(Message(role="tool", content=result, tool_call_id=tool_call.id))
+                        self._emit(AuditEvent(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            session_id=self.session_id,
+                            event_type="tool_blocked",
+                            iteration=iteration_count,
+                            phase=self.phase.value,
+                            tool_name=tool_call.name,
+                            arguments=args,
+                            result_status="blocked",
+                            result_summary=result,
+                            result_content=result,
+                            working_directory=self.working_directory,
+                            metadata={"block_reason": "phase_disallowed", "allowed_tools": list(allowed)},
+                        ))
                         continue
 
                     # ==========================================
@@ -456,6 +663,20 @@ class Agent:
                     if not is_safe:
                         result = block_reason
                         self.console.print(f"[bold red]{block_reason}[/bold red]")
+                        self._emit(AuditEvent(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            session_id=self.session_id,
+                            event_type="tool_blocked",
+                            iteration=iteration_count,
+                            phase=self.phase.value,
+                            tool_name=tool_call.name,
+                            arguments=args,
+                            result_status="blocked",
+                            result_summary=block_reason,
+                            result_content=block_reason,
+                            working_directory=self.working_directory,
+                            metadata={"block_reason": "security"},
+                        ))
 
                     # ==========================================
                     # 2. PLAN CREATION TRACKING
@@ -475,6 +696,15 @@ class Agent:
                         if self.current_plan:
                             self.current_plan[0]["status"] = "in_progress"
                             await self._check_phase_transition()
+                            self._emit(AuditEvent(
+                                timestamp=datetime.now(timezone.utc).isoformat(),
+                                session_id=self.session_id,
+                                event_type="plan_state_change",
+                                iteration=iteration_count,
+                                phase=self.phase.value,
+                                working_directory=self.working_directory,
+                                metadata={"change": "create", "step_count": len(self.current_plan)},
+                            ))
 
                     # ==========================================
                     # 3. Human-in-the-Loop Questions
@@ -522,6 +752,15 @@ class Agent:
                                 result = f"Step {step_num} marked as {status}."
                                 # Check for phase transition after status update
                                 await self._check_phase_transition()
+                                self._emit(AuditEvent(
+                                    timestamp=datetime.now(timezone.utc).isoformat(),
+                                    session_id=self.session_id,
+                                    event_type="plan_state_change",
+                                    iteration=iteration_count,
+                                    phase=self.phase.value,
+                                    working_directory=self.working_directory,
+                                    metadata={"change": "status", "step": step_num, "status": status},
+                                ))
                             else:
                                 result = f"Error: step_number {step_num} out of range."
 
