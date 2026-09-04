@@ -41,6 +41,10 @@ class MongoSTM(BaseMemory):
         context_window: int = None,
         memory_allocation: dict = None,
     ):
+        # Per-message token cache. Keyed by id(msg); entries invalidated when
+        # the underlying message is mutated (e.g. by _compact_for_context).
+        # Keeps _count_tokens O(1) per message after the first call.
+        self._token_cache: dict[int, int] = {}
         self.session_id = session_id
         self.max_messages = max_messages
         self.system_prompt = system_prompt
@@ -81,19 +85,37 @@ class MongoSTM(BaseMemory):
         self._cache_dirty = True
 
     def _count_tokens(self, messages: list[Message]) -> int:
-        """Count tokens in a list of messages using tiktoken."""
+        """Count tokens in a list of messages using tiktoken.
+
+        Caches per-message token counts on the instance (keyed by id(msg))
+        so repeated calls over the same Message objects are O(1) per message.
+        _compact_for_context clears the relevant cache entries when it mutates
+        a message in place; add_message invalidates the entire cache.
+        """
         total = 0
         for m in messages:
-            total += 4
+            mid = id(m)
+            cached = self._token_cache.get(mid)
+            if cached is not None:
+                total += cached
+                continue
+            n = 4
             if m.content:
-                total += len(self.encoding.encode(m.content))
+                n += len(self.encoding.encode(m.content))
             if m.tool_calls:
                 for tc in m.tool_calls:
-                    total += len(self.encoding.encode(tc.name))
-                    total += len(self.encoding.encode(str(tc.arguments)))
+                    n += len(self.encoding.encode(tc.name))
+                    n += len(self.encoding.encode(str(tc.arguments)))
             if m.tool_call_id:
-                total += len(self.encoding.encode(m.tool_call_id))
+                n += len(self.encoding.encode(m.tool_call_id))
+            self._token_cache[mid] = n
+            total += n
         return total
+
+    def _invalidate_token_cache(self):
+        """Drop the per-message cache. Used when messages are mutated
+        in place or replaced wholesale."""
+        self._token_cache.clear()
 
     def get_token_usage(self) -> dict:
         """Get current token usage statistics."""
@@ -119,6 +141,9 @@ class MongoSTM(BaseMemory):
              "$set": {"updated_at": datetime.utcnow()}}
         )
         self._cache_dirty = True
+        # New message means prior per-message token counts may be stale
+        # (the cached list no longer matches what's in Mongo).
+        self._invalidate_token_cache()
 
     def get_context(self) -> list[Message]:
         if not self._cache_dirty and self._cache is not None:
@@ -165,21 +190,146 @@ class MongoSTM(BaseMemory):
         allocated_for_context = system_prompt_budget + message_tokens_budget
         total_used = self._count_tokens([system_msg] + compacted_history)
 
+        # If we're still over the combined budget, evict pair-aware from
+        # the front of the history. Reuses the same loop body as
+        # _enforce_token_budget for consistency.
         if total_used > allocated_for_context:
+            safety = 0
             while total_used > allocated_for_context and len(compacted_history) > 2:
-                compacted_history.pop(0)
-                total_used = self._count_tokens([system_msg] + compacted_history)
+                safety += 1
+                if safety > len(compacted_history) * 2:
+                    break
+
+                evicted = False
+                for i in range(len(compacted_history)):
+                    m = compacted_history[i]
+                    if m.role == "system":
+                        continue
+                    if m.role == "tool":
+                        continue
+                    if m.role == "assistant" and m.tool_calls:
+                        orphan_ids = {tc.id for tc in m.tool_calls if tc.id}
+                        del compacted_history[i]
+                        if orphan_ids:
+                            compacted_history = [
+                                mm for mm in compacted_history
+                                if not (mm.role == "tool" and mm.tool_call_id in orphan_ids)
+                            ]
+                    else:
+                        del compacted_history[i]
+
+                    self._invalidate_token_cache()
+                    total_used = self._count_tokens([system_msg] + compacted_history)
+                    evicted = True
+                    break
+
+                if not evicted:
+                    break
+
+        # Final structural-integrity sweep. Removes any orphans left over
+        # from prior compactions or budget trims. Cheap: O(n).
+        compacted_history = self._drop_orphans(compacted_history)
+        self._invalidate_token_cache()
 
         self._cache = [system_msg] + compacted_history
         self._cache_dirty = False
         return list(self._cache)
 
-    def _enforce_token_budget(self, messages: list[Message], max_tokens: int) -> list[Message]:
-        """Trim messages from the start if over token budget."""
-        while self._count_tokens(messages) > max_tokens and len(messages) > 3:
-            if len(messages) > 1:
-                messages.pop(1)
+    # ------------------------------------------------------------------ #
+    # Structural integrity: every role=tool message must reference a real
+    # tool_call_id produced by a preceding role=assistant message. Every
+    # role=assistant message that issued tool_calls must have matching
+    # role=tool responses. Otherwise the provider rejects the turn with
+    # "tool result's tool id not found (2013)".
+    # ------------------------------------------------------------------ #
+    def _drop_orphans(self, messages: list[Message]) -> list[Message]:
+        """Remove tool messages that reference unknown tool_call_ids, and
+        assistant messages whose tool_calls are missing responses."""
+        if not messages:
+            return messages
+
+        # First pass: collect every tool_call_id any assistant has issued.
+        issued_ids: set[str] = set()
+        for m in messages:
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    if tc.id:
+                        issued_ids.add(tc.id)
+
+        # Second pass: drop tool messages whose id was never issued.
+        cleaned: list[Message] = []
+        for m in messages:
+            if m.role == "tool":
+                if m.tool_call_id and m.tool_call_id in issued_ids:
+                    cleaned.append(m)
+                # else: orphan, drop it
             else:
+                cleaned.append(m)
+        return cleaned
+
+    def _collect_orphan_ids(self, messages: list[Message]) -> set[str]:
+        """Return the set of tool_call_ids that are missing a tool response.
+        Used by pair-popping to know which assistant messages to evict."""
+        responded: set[str] = set()
+        for m in messages:
+            if m.role == "tool" and m.tool_call_id:
+                responded.add(m.tool_call_id)
+        orphans: set[str] = set()
+        for m in messages:
+            if m.role == "assistant" and m.tool_calls:
+                for tc in m.tool_calls:
+                    if tc.id and tc.id not in responded:
+                        orphans.add(tc.id)
+        return orphans
+
+    def _enforce_token_budget(self, messages: list[Message], max_tokens: int) -> list[Message]:
+        """Trim messages from the start if over token budget.
+
+        Trimming is pair-aware: when we drop an assistant message that
+        issued tool_calls, we also drop its now-orphaned tool responses.
+        This keeps the conversation structurally valid for the provider.
+        """
+        safety = 0
+        while self._count_tokens(messages) > max_tokens and len(messages) > 3:
+            safety += 1
+            if safety > len(messages) * 2:
+                # Pathological: bail out rather than loop forever.
+                break
+
+            # Find the oldest *evictable* unit: either a non-tool,
+            # non-system message whose removal won't break the stream.
+            evicted = False
+            for i in range(len(messages)):
+                m = messages[i]
+                if m.role == "system":
+                    continue
+                if m.role == "tool":
+                    # Never drop a tool message without also dropping its
+                    # issuing assistant; the assistant is older, so we'd
+                    # already have handled it on a previous pass. If we
+                    # see a tool here, skip it.
+                    continue
+
+                if m.role == "assistant" and m.tool_calls:
+                    orphan_ids = {tc.id for tc in m.tool_calls if tc.id}
+                    del messages[i]
+                    # Drop matching tool responses that follow.
+                    if orphan_ids:
+                        messages = [
+                            mm for mm in messages
+                            if not (mm.role == "tool" and mm.tool_call_id in orphan_ids)
+                        ]
+                else:
+                    # Plain user or assistant text: safe to evict.
+                    del messages[i]
+
+                evicted = True
+                # Invalidate the cache because the indices shifted.
+                self._invalidate_token_cache()
+                break
+
+            if not evicted:
+                # Nothing left we can safely drop.
                 break
         return messages
 
@@ -193,6 +343,7 @@ class MongoSTM(BaseMemory):
 
         for i in range(cutoff):
             msg = history[i]
+            mutated = False
 
             if msg.role == "tool" and msg.content and len(msg.content) > self.COMPACT_THRESHOLD_CHARS:
                 line_count = msg.content.count("\n") + 1
@@ -201,6 +352,7 @@ class MongoSTM(BaseMemory):
                     f"~{line_count} lines. Already consumed in a prior "
                     f"turn; re-read the file/tool if you need it again.]"
                 )
+                mutated = True
 
             if msg.role == "assistant" and msg.tool_calls:
                 for tc in msg.tool_calls:
@@ -220,6 +372,11 @@ class MongoSTM(BaseMemory):
                                 })
                             except (json.JSONDecodeError, AttributeError):
                                 tc.arguments = json.dumps({"_note": f"<{len(args_str)} chars, unreadable>"})
+                        mutated = True
+
+            if mutated:
+                # The cached token count for this message is now wrong.
+                self._token_cache.pop(id(msg), None)
 
         return history
 

@@ -29,6 +29,9 @@ PHASE_TOOL_ALLOWLIST: dict[AgentPhase, list[str]] = {
         "ask_user_question",
         "run_shell_command",
         "run_git",
+        "find_files",
+        "update_scratchpad",
+        "read_scratchpad",
     ],
     AgentPhase.PLANNING: [
         "read_file",
@@ -38,6 +41,9 @@ PHASE_TOOL_ALLOWLIST: dict[AgentPhase, list[str]] = {
         "create_project_plan",
         "update_plan_text",
         "ask_user_question",
+        "find_files",
+        "update_scratchpad",
+        "read_scratchpad",
     ],
     AgentPhase.EXECUTING: [
         "read_file",
@@ -48,6 +54,9 @@ PHASE_TOOL_ALLOWLIST: dict[AgentPhase, list[str]] = {
         "update_plan_status",
         "update_plan_text",
         "ask_user_question",
+        "find_files",
+        "update_scratchpad",
+        "read_scratchpad",
     ],
     AgentPhase.VERIFYING: [
         "read_file",
@@ -55,9 +64,13 @@ PHASE_TOOL_ALLOWLIST: dict[AgentPhase, list[str]] = {
         "run_git",
         "update_plan_status",
         "ask_user_question",
+        "find_files",
+        "update_scratchpad",
+        "read_scratchpad",
     ],
     AgentPhase.COMPLETED: [
         "ask_user_question",
+        "read_scratchpad",
     ],
     AgentPhase.RETRYING: [
         "read_file",
@@ -68,6 +81,9 @@ PHASE_TOOL_ALLOWLIST: dict[AgentPhase, list[str]] = {
         "update_plan_status",
         "update_plan_text",
         "ask_user_question",
+        "find_files",
+        "update_scratchpad",
+        "read_scratchpad",
     ],
 }
 
@@ -111,6 +127,11 @@ class PhaseTransition:
         if current_phase == AgentPhase.EXECUTING:
             if all(s.get("status") in ("completed", "failed") for s in plan):
                 return AgentPhase.VERIFYING
+
+        # VERIFYING → RETRYING: any step failed and needs rework (Phase 2)
+        if current_phase == AgentPhase.VERIFYING:
+            if any(s.get("status") == "failed" for s in plan):
+                return AgentPhase.RETRYING
 
         # VERIFYING → COMPLETED: verification passed (no pending files)
         if current_phase == AgentPhase.VERIFYING:

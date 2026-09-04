@@ -2,12 +2,14 @@ import os
 from typing import Any, Generator, AsyncGenerator
 from anthropic import Anthropic, AsyncAnthropic
 from .base import LLMProvider, LLMResponse, Message, ToolCall
+from src.audit.logger import AuditEvent
 
 
 class AnthropicProvider(LLMProvider):
     """Anthropic Provider for coding agent."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, audit_callback=None):
+        super().__init__(audit_callback=audit_callback)
         self.model = config.get("model", "claude-3-5-sonnet-20241022")
         api_key = config.get("api_key", os.getenv("ANTHROPIC_API_KEY"))
         self.client = Anthropic(
@@ -98,6 +100,7 @@ class AnthropicProvider(LLMProvider):
         )
 
     def complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        from datetime import datetime, timezone
         # Separate system messages from regular messages
         system_message = None
         formatted_messages = []
@@ -123,10 +126,75 @@ class AnthropicProvider(LLMProvider):
         if tools:
             create_kwargs["tools"] = self._format_tools(tools)
 
-        response = self.client.messages.create(**create_kwargs)
-        return self._parse_response(response)
+        # llm_request
+        if self.audit_callback:
+            try:
+                self.audit_callback(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=None,
+                    event_type="llm_request",
+                    model=self.model,
+                    metadata={"num_messages": len(anthropic_messages), "has_tools": bool(tools)},
+                ))
+            except Exception:
+                pass
+
+        try:
+            response = self.client.messages.create(**create_kwargs)
+        except Exception as exc:
+            # llm_error
+            if self.audit_callback:
+                try:
+                    self.audit_callback(AuditEvent(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        session_id=None,
+                        event_type="llm_error",
+                        model=self.model,
+                        result_summary=str(exc)[:500],
+                        result_content=str(exc),
+                    ))
+                except Exception:
+                    pass
+            raise
+
+        parsed = self._parse_response(response)
+        # llm_response
+        if self.audit_callback:
+            try:
+                self.audit_callback(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=None,
+                    event_type="llm_response",
+                    model=self.model,
+                    input_tokens=parsed.input_tokens,
+                    output_tokens=parsed.output_tokens,
+                    metadata={"stop_reason": parsed.stop_reason, "has_tool_calls": bool(parsed.tool_calls)},
+                ))
+            except Exception:
+                pass
+        # v2: one llm_thinking event per Anthropic thinking block.
+        if self.audit_callback:
+            try:
+                for block in response.content:
+                    if getattr(block, "type", None) == "thinking":
+                        thinking_text = block.thinking or ""
+                        self.audit_callback(AuditEvent(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            session_id=None,
+                            event_type="llm_thinking",
+                            model=self.model,
+                            result_content=thinking_text,
+                            result_summary=thinking_text[:500],
+                            input_tokens=parsed.input_tokens,
+                            output_tokens=parsed.output_tokens,
+                            metadata={"block_index": list(response.content).index(block)},
+                        ))
+            except Exception:
+                pass
+        return parsed
 
     async def async_complete(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> LLMResponse:
+        from datetime import datetime, timezone
         # Separate system messages from regular messages
         system_message = None
         formatted_messages = []
@@ -152,8 +220,72 @@ class AnthropicProvider(LLMProvider):
         if tools:
             create_kwargs["tools"] = self._format_tools(tools)
 
-        response = await self.async_client.messages.create(**create_kwargs)
-        return self._parse_response(response)
+        # llm_request
+        if self.audit_callback:
+            try:
+                self.audit_callback(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=None,
+                    event_type="llm_request",
+                    model=self.model,
+                    metadata={"num_messages": len(anthropic_messages), "has_tools": bool(tools)},
+                ))
+            except Exception:
+                pass
+
+        try:
+            response = await self.async_client.messages.create(**create_kwargs)
+        except Exception as exc:
+            # llm_error
+            if self.audit_callback:
+                try:
+                    self.audit_callback(AuditEvent(
+                        timestamp=datetime.now(timezone.utc).isoformat(),
+                        session_id=None,
+                        event_type="llm_error",
+                        model=self.model,
+                        result_summary=str(exc)[:500],
+                        result_content=str(exc),
+                    ))
+                except Exception:
+                    pass
+            raise
+
+        parsed = self._parse_response(response)
+        # llm_response
+        if self.audit_callback:
+            try:
+                self.audit_callback(AuditEvent(
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                    session_id=None,
+                    event_type="llm_response",
+                    model=self.model,
+                    input_tokens=parsed.input_tokens,
+                    output_tokens=parsed.output_tokens,
+                    metadata={"stop_reason": parsed.stop_reason, "has_tool_calls": bool(parsed.tool_calls)},
+                ))
+            except Exception:
+                pass
+        # v2: one llm_thinking event per Anthropic thinking block.
+        if self.audit_callback:
+            try:
+                for block in response.content:
+                    if getattr(block, "type", None) == "thinking":
+                        thinking_text = block.thinking or ""
+                        self.audit_callback(AuditEvent(
+                            timestamp=datetime.now(timezone.utc).isoformat(),
+                            session_id=None,
+                            event_type="llm_thinking",
+                            model=self.model,
+                            result_content=thinking_text,
+                            result_summary=thinking_text[:500],
+                            input_tokens=parsed.input_tokens,
+                            output_tokens=parsed.output_tokens,
+                            metadata={"block_index": list(response.content).index(block)},
+                        ))
+            except Exception:
+                pass
+        return parsed
 
     def stream(self, messages: list[Message], tools: list[dict] = None, **kwargs: Any) -> Generator[LLMResponse, None, None]:
         # Separate system messages from regular messages

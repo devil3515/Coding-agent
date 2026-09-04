@@ -115,18 +115,21 @@ class ProjectMemoryManager:
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
             clean_content = clean_content[start_idx:end_idx + 1]
 
-        parsed_pm = json.loads(clean_content)
-
-        # Update project_mem model fields
-        project_mem.memory = ProjectMemoryContent(
-            purpose=parsed_pm.get("purpose", project_mem.memory.purpose),
-            architecture=parsed_pm.get("architecture", project_mem.memory.architecture),
-            decisions=parsed_pm.get("decisions", project_mem.memory.decisions),
-            errors=parsed_pm.get("errors", project_mem.memory.errors),
-            preferences=parsed_pm.get("preferences", project_mem.memory.preferences),
-            current_status=parsed_pm.get("current_status", project_mem.memory.current_status),
-            key_files=parsed_pm.get("key_files", project_mem.memory.key_files)
-        )
+        try:
+            parsed_pm = json.loads(clean_content)
+            # Update project_mem model fields
+            project_mem.memory = ProjectMemoryContent(
+                purpose=parsed_pm.get("purpose", project_mem.memory.purpose),
+                architecture=parsed_pm.get("architecture", project_mem.memory.architecture),
+                decisions=parsed_pm.get("decisions", project_mem.memory.decisions),
+                errors=parsed_pm.get("errors", project_mem.memory.errors),
+                preferences=parsed_pm.get("preferences", project_mem.memory.preferences),
+                current_status=parsed_pm.get("current_status", project_mem.memory.current_status),
+                key_files=parsed_pm.get("key_files", project_mem.memory.key_files)
+            )
+        except Exception:
+            # ponytail: fallback to existing memory if LLM output fails to parse as valid JSON
+            pass
 
         # Append current session to recent_sessions
         session_info = {

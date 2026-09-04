@@ -25,11 +25,13 @@ from src.memory.project_memory import ProjectMemoryManager
 from src.models import ShortTermMemoryModel, LongTermMemoryModel, ProjectMemoryContent, ProjectMemoryModel
 from src.llm.base import Message
 from src.tools.codebase_graph import search_codebase, get_codebase_overview
-from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree
+from src.tools.file_tools import read_file, write_file, apply_diff, get_file_tree, find_files
 from src.tools.planning import create_project_plan, update_project_plan, ask_user_question, update_plan_text
+from src.tools.scratchpad import update_scratchpad, read_scratchpad
 from prompts.registry import get_default_prompt
 from src.mcp.bridge import MCPBridge
-from src.audit.logger import AuditLogger
+from src.audit.logger import AuditLogger, AuditEvent
+from typing import Callable
 from src.tools import schemas
 from prompt_toolkit import PromptSession
 from prompt_toolkit.key_binding import KeyBindings
@@ -48,6 +50,7 @@ def create_agent_session(
     ltm: LongTermMemory = None,
     llm_config: dict = None,
     working_directory: str = None,
+    audit: AuditLogger = None,
 ) -> Agent:
     """Create a new agent session with the given configuration."""
     db_conf = config["database"]
@@ -80,20 +83,37 @@ def create_agent_session(
         llm_config=llm_config,
         working_directory=working_directory,
         session_id=session_id,
+        harness=config.get("harness", {}),
+        audit_logger=audit,
     )
 
 
 async def async_main():
     config = load_settings()
-    llm = OpenAIProvider(config["llm"])
     db_conf = config["database"]
     working_directory = os.getcwd()
     abs_path = os.path.abspath(working_directory)
-    audit = AuditLogger()
+    audit = AuditLogger(
+        mongo_uri=db_conf.get("mongo_uri"),
+        db_name=db_conf.get("db_name", "coding_agent"),
+        collection=db_conf.get("audit_collection", "audit_events"),
+        log_dir=db_conf.get("audit_log_dir", ".agent-audit"),
+        working_directory=working_directory,
+    )
     registry = ToolRegistry(
         audit_logger=audit,
         working_directory=working_directory,
     )
+
+    def _make_llm_audit_cb(audit_logger: AuditLogger, registry_ref) -> Callable[[AuditEvent], None]:
+        def _cb(event: AuditEvent) -> None:
+            if event.session_id is None:
+                event.session_id = registry_ref.session_id
+            audit_logger.event(event)
+        return _cb
+
+    llm_audit_cb = _make_llm_audit_cb(audit, registry)
+    llm = OpenAIProvider(config["llm"], audit_callback=llm_audit_cb)
 
     project_id = hashlib.sha256(abs_path.encode()).hexdigest()[:16]
 
@@ -311,6 +331,78 @@ async def async_main():
         pydantic_schema=schemas.GetFileTreeArgs,
     )
 
+    # -- FIND FILES TOOL (GLOB) ------------------------------------------------
+    registry.register(
+        name="find_files",
+        description=(
+            "Searches for files matching a glob pattern within a directory. "
+            "Use this to locate files by name or pattern (e.g. '*.py', 'test_*.py', "
+            "'**/*.yaml') instead of guessing paths. Prefer this over read_file when "
+            "you don't know the exact file name."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob pattern to match file names. Examples: '*.py', 'test_*.py', '**/*.yaml', 'config.{json,yaml}'.",
+                },
+                "directory": {"type": "string", "description": "Starting directory (default '.')."},
+                "max_results": {"type": "integer", "description": "Max files to return (default 50, max 500)."},
+            },
+            "required": ["pattern"],
+        },
+        function=lambda pattern, directory=".", max_results=50: find_files(
+            pattern,
+            directory if (directory and directory != ".") else working_directory,
+            max_results,
+        ),
+        pydantic_schema=schemas.FindFilesArgs,
+    )
+
+    # -- SCRATCHPAD TOOLS ------------------------------------------------------
+    scratchpad_max_chars = config.get("harness", {}).get("scratchpad_max_chars", 20000)
+
+    registry.register(
+        name="update_scratchpad",
+        description=(
+            "Writes markdown to your private working-memory file at "
+            ".agent-audit/scratchpad.md. Use this to record: (1) your current "
+            "hypothesis, (2) files you have already read and ruled out, and "
+            "(3) what you plan to read next. The harness auto-injects the latest "
+            "scratchpad into your context every turn, so you do not need to "
+            "re-read it yourself."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Markdown content to write. Overwrites the previous scratchpad.",
+                },
+            },
+            "required": ["content"],
+        },
+        function=lambda content: update_scratchpad(
+            content=content,
+            working_directory=working_directory,
+            max_chars=scratchpad_max_chars,
+        ),
+        pydantic_schema=schemas.UpdateScratchpadArgs,
+    )
+
+    registry.register(
+        name="read_scratchpad",
+        description=(
+            "Returns the current scratchpad contents. Returns a 'no scratchpad yet' "
+            "message if the file does not exist. Use this to review your working "
+            "memory before committing to a new line of investigation."
+        ),
+        parameters={"type": "object", "properties": {}},
+        function=lambda: read_scratchpad(working_directory=working_directory),
+        pydantic_schema=schemas.ReadScratchpadArgs,
+    )
+
     # -- MCP TOOLS ------------------------------------------------------------
     mcp_bridges = []
     if "mcp_servers" in config:
@@ -366,8 +458,9 @@ async def async_main():
 
     current_session_id = f"session_{uuid.uuid4().hex[:6]}"
     registry.session_id = current_session_id
+    audit.session_id = current_session_id
     agent = create_agent_session(
-        config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory
+        config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory, audit=audit
     )
 
     # Startup diagnostic
@@ -441,8 +534,9 @@ async def async_main():
             elif user_input.lower() == "/new":
                 current_session_id = f"session_{uuid.uuid4().hex[:6]}"
                 registry.session_id = current_session_id
+                audit.session_id = current_session_id
                 agent = create_agent_session(
-                    config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory
+                    config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory, audit=audit
                 )
                 console.print(f"[bold green]✨ Started new session: {current_session_id}[/bold green]")
 
@@ -481,8 +575,9 @@ async def async_main():
                         selected_id = sessions[idx]["session_id"]
                         current_session_id = selected_id
                         registry.session_id = current_session_id
+                        audit.session_id = current_session_id
                         agent = create_agent_session(
-                            config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory
+                            config, llm, registry, current_session_id, ltm, config["llm"], working_directory=working_directory, audit=audit
                         )
                         console.print(f"[bold green]♻️ Resumed session: {current_session_id}[/bold green]")
                     else:
@@ -565,7 +660,7 @@ async def async_main():
             local_mem_file = os.path.join(working_directory, ".agent-memory.json")
             console.print(f"[bold green]✅ Exported project context to {local_mem_file}[/bold green]")
         except Exception as e:
-            console.print(f"[bold red]Could not update project memory: {e}[/red]")
+            console.print(f"[bold red]Could not update project memory: {e}[/bold red]")
 
         if mcp_bridges:
             console.print("[dim]Shutting down MCP connections...[/dim]")

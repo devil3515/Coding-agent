@@ -47,8 +47,11 @@ async def run_shell_command_async(command: str, working_directory: str = None) -
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
             return "Command timed out after 30 seconds."
 
         output = ""

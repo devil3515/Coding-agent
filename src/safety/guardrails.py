@@ -54,20 +54,36 @@ def is_safe_path(requested_path: str, working_directory: str) -> tuple[bool, str
 
 def is_shell_safe(command: str, working_directory: str) -> tuple[bool, str]:
     """Checks if a bash command is safe to run."""
-    command = command.strip().lower()
+    command_lower = command.strip().lower()
 
     for pattern in DANGEROUS_SHELL_PATTERNS:
-        if re.search(pattern, command):
+        if re.search(pattern, command_lower):
             return (
                 False,
                 f"⛔ SECURITY ERROR: Dangerous shell command blocked: {command}",
             )
 
-    if "../" in command or "..\" in command:
-        if not any(cmd in command for cmd in ["git ", "python ", "node ", "npm ", "uv "]):
-            return (
-                False,
-                f"⛔ SECURITY ERROR: Navigating outside the directory (../) is blocked.",
-            )
+    if "../" in command_lower or "..\\" in command_lower:
+        allowed_cmds = [
+            "git ", "python ", "python3 ", "node ", "npm ", "uv ", "cargo ",
+            "sed ", "echo ", "printf ", "cat ", "cp ", "mv ", "touch "
+        ]
+        if not any(cmd in command_lower for cmd in allowed_cmds):
+            try:
+                work_path = Path(working_directory).resolve()
+                for token in re.split(r'[\s;&|]+', command):
+                    token_clean = token.strip('"\'')
+                    if "../" in token_clean or "..\\" in token_clean:
+                        resolved = (work_path / token_clean).resolve()
+                        if not resolved.is_relative_to(work_path):
+                            return (
+                                False,
+                                "⛔ SECURITY ERROR: Navigating outside the working directory (../) is blocked.",
+                            )
+            except Exception:
+                return (
+                    False,
+                    "⛔ SECURITY ERROR: Navigating outside the working directory (../) is blocked.",
+                )
 
     return True, ""
